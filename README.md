@@ -107,3 +107,10 @@ review-copilot/
 ```
 
 The design separates the review engine from Bob itself — Bob is the orchestration and execution layer (agent mode, subagents, document parsing), while the engine defines what gets checked, how findings are validated, and what "done" means, so the same core logic could run through a different host if needed.
+
+
+
+
+<img width="2720" height="2240" alt="review_copilot_pipeline" src="https://github.com/user-attachments/assets/6561f869-c319-4fea-9722-d1b8b4b905ff" />
+
+
