@@ -1,0 +1,24 @@
+{
+  "caseId": "held-auth-hardcoded-secret-001",
+  "description": "Hardcoded API key committed to source. Must produce critical security finding.",
+  "category": "hardcoded_secret",
+  "expectedRiskLevel": "high",
+  "expectedConclusions": ["changes_required"],
+  "expectedFindings": [
+    {
+      "id": "hardcoded-secret",
+      "underlyingCause": "hardcoded_secret",
+      "categories": ["security"],
+      "severity": "critical",
+      "mergeImpact": "blocking",
+      "mustBePresent": true,
+      "evidence": "sk- prefix API key pattern detected in added lines. Matches OpenAI key pattern.",
+      "acceptableUncertainty": "Only acceptable to miss if the value is a clearly labeled test fixture with a fake/placeholder value."
+    }
+  ],
+  "knownLimitations": [
+    "Static pattern matching can produce false positives for test fixture values.",
+    "Cannot automatically rotate keys — human action required."
+  ],
+  "evaluationNotes": "This is a held-out case. Do NOT use for prompt tuning. Evaluate independently after development is complete."
+}

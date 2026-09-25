@@ -1,0 +1,151 @@
+review-copilot/
+├── README.md
+├── CONTRIBUTING.md
+├── package.json
+├── package-lock.json
+├── tsconfig.json
+├── eslint.config.mjs
+├── .gitignore
+├── .env.example
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+│
+├── prompts/
+│   ├── aby-implementation.md
+│   └── rijin-implementation.md
+│
+├── config/
+│   ├── review.example.json
+│   └── policy.example.json
+│
+├── examples/
+│   ├── pr-metadata.json
+│   └── local-review/
+│       └── README.md
+│
+├── src/
+│   ├── contracts/                  # Shared: agreed before parallel work
+│   │   ├── common.ts
+│   │   ├── capabilities.ts
+│   │   ├── configuration.ts
+│   │   ├── policy.ts
+│   │   ├── run.ts
+│   │   ├── snapshot.ts
+│   │   ├── brief.ts
+│   │   ├── risk.ts
+│   │   ├── plan.ts
+│   │   ├── evidence.ts
+│   │   ├── finding.ts
+│   │   ├── check.ts
+│   │   ├── patch.ts
+│   │   ├── decision.ts
+│   │   ├── report.ts
+│   │   ├── publication.ts
+│   │   └── index.ts
+│   │
+│   ├── ports/                      # Shared: interfaces, no implementations
+│   │   ├── repository.ts
+│   │   ├── metadata.ts
+│   │   ├── model.ts
+│   │   ├── verification.ts
+│   │   ├── publication.ts
+│   │   ├── store.ts
+│   │   ├── review-services.ts
+│   │   └── index.ts
+│   │
+│   ├── app/                        # ABY: wires platform and review together
+│   │   ├── bootstrap.ts
+│   │   └── services.ts
+│   │
+│   ├── cli/                        # ABY
+│   │   ├── index.ts
+│   │   └── commands/
+│   │       ├── capabilities.ts
+│   │       ├── review.ts
+│   │       ├── resume.ts
+│   │       └── report.ts
+│   │
+│   ├── platform/                   # ABY
+│   │   ├── discovery/
+│   │   ├── configuration/
+│   │   ├── policy/
+│   │   ├── intake/
+│   │   ├── snapshots/
+│   │   ├── workflow/
+│   │   ├── scheduling/
+│   │   ├── persistence/
+│   │   │   └── migrations/
+│   │   ├── evidence/
+│   │   ├── privacy/
+│   │   ├── verification/
+│   │   ├── publication/
+│   │   ├── patches/
+│   │   └── reporting/
+│   │
+│   ├── review/                     # Rijin
+│   │   ├── context/
+│   │   ├── documents/
+│   │   ├── intent/
+│   │   ├── risk/
+│   │   ├── planning/
+│   │   ├── reviewers/
+│   │   │   ├── correctness.ts
+│   │   │   ├── impact.ts
+│   │   │   ├── tests.ts
+│   │   │   ├── standards.ts
+│   │   │   └── security.ts
+│   │   ├── prompts/
+│   │   ├── validation/
+│   │   ├── deduplication/
+│   │   ├── attribution/
+│   │   ├── conclusions/
+│   │   ├── reporting/
+│   │   └── patches/
+│   │
+│   └── adapters/
+│       ├── git/                    # ABY
+│       ├── metadata/               # ABY
+│       ├── sqlite/                 # ABY
+│       ├── execution/              # ABY
+│       ├── github/                 # ABY
+│       ├── bob/                    # ABY
+│       ├── models/                 # Rijin
+│       └── documents/              # Rijin
+│
+├── tests/
+│   ├── contracts/                  # Shared
+│   ├── unit/
+│   │   ├── platform/               # ABY
+│   │   └── review/                 # Rijin
+│   ├── integration/               # Shared
+│   ├── adversarial/               # Shared
+│   ├── e2e/                       # Shared
+│   ├── fixtures/
+│   │   ├── repositories/
+│   │   ├── metadata/
+│   │   ├── documents/
+│   │   └── model-responses/
+│   └── support/
+│       ├── mock-reviewer.ts
+│       ├── fake-publication.ts
+│       └── fixture-repository.ts
+│
+├── evaluation/                     # Rijin
+│   ├── development/
+│   ├── held-out/
+│   └── README.md
+│
+└── docs/
+    ├── architecture.md
+    ├── contracts.md
+    ├── capabilities.md
+    ├── threat-model.md
+    ├── adapters.md
+    ├── operations.md
+    ├── evaluation.md
+    ├── limitations.md
+    └── handoff/
+        ├── aby.md
+        └── rijin.md

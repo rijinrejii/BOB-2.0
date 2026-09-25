@@ -1,0 +1,21 @@
+{
+  "caseId": "dev-auth-defect-001",
+  "description": "One-line authorization defect: route handler missing auth middleware. Expected to produce high-severity security finding.",
+  "category": "authorization_defect",
+  "expectedRiskLevel": "high",
+  "expectedConclusions": ["changes_required", "human_decision_required"],
+  "expectedFindings": [
+    {
+      "id": "missing-auth-route",
+      "underlyingCause": "missing_authorization",
+      "categories": ["security"],
+      "severity": "high",
+      "mergeImpact": "blocking",
+      "mustBePresent": true,
+      "evidence": "Route handler added without auth middleware in diff. No auth import visible.",
+      "acceptableUncertainty": "If auth middleware is applied globally at the router level and that is documented."
+    }
+  ],
+  "knownLimitations": ["Cannot trace caller-level auth without full codebase access."],
+  "evaluationNotes": "This is the primary correctness case for security reviewer. Should not require model — static pattern detection sufficient."
+}

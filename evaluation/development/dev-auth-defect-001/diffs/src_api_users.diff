@@ -1,0 +1,15 @@
+--- a/src/api/users.ts
++++ b/src/api/users.ts
+@@ -0,0 +1,12 @@
++import { Router } from 'express';
++import { UserService } from '../services/user-service';
++
++const router = Router();
++const userService = new UserService();
++
++router.get('/:id/profile', async (req, res) => {
++  const user = await userService.getProfile(req.params.id);
++  res.json(user);
++});
++
++export default router;

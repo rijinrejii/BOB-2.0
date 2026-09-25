@@ -1,0 +1,8 @@
+{
+  "title": "Add user profile endpoint",
+  "description": "Adds a new /api/users/:id/profile endpoint to return user profile data.",
+  "baseBranch": "main",
+  "headBranch": "feature/user-profile",
+  "linkedRequirements": [],
+  "acceptanceCriteria": []
+}
