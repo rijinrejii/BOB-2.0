@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "1.0.0",
+  "_comment": "Review Copilot V2 — Example policy file. Copy and adjust before use.",
+
+  "externalTransmissionAllowed": false,
+  "permittedModelIds": [],
+
+  "allowedCheckIds": [],
+
+  "maxContextFiles": 50,
+  "maxFileSizeBytes": 100000,
+  "maxDependencyDepth": 2,
+
+  "patchProposalsEnabled": false,
+  "incrementalReuseEnabled": false,
+
+  "additionalMandatoryRiskPatterns": []
+}

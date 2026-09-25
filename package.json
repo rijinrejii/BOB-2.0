@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=20.0.0"
   },
+  "bin": {
+    "review-copilot": "./dist/cli/main.js"
+  },
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "typecheck": "tsc --noEmit",
@@ -15,15 +18,18 @@
     "lint": "eslint src tests --ext .ts"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "commander": "^15.0.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.5.0",
-    "vitest": "^2.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
     "@vitest/coverage-v8": "^2.0.0",
     "eslint": "^9.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0"
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
   }
 }
