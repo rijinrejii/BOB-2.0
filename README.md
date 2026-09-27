@@ -1,13 +1,106 @@
 # BOB-2.0
 AI-powered PR review tool using IBM Bob 2.0 agent mode. Parallel subagents check correctness, impact, tests, standards &amp; security on a diff, validate findings before posting, and produce a risk-tiered, evidence-backed review report for the human reviewer to act on.
 
-
-
 # Review Copilot V2
 
 An evidence-backed, risk-aware pull request review system.
 
 > **Status:** This is a design preview, not finished software. Nothing here has been built or tested yet — it's the plan we're building from.
+
+---
+
+## Getting started
+
+### Prerequisites
+
+- **Node.js ≥ 20** — `node --version`
+- **Git** — `git --version`
+
+### Install and build
+
+```bash
+npm install
+npm run build
+```
+
+### Quickest run — review this repo's last commit
+
+```bash
+node dist/cli/main.js review HEAD~1 HEAD --fixture-mode
+```
+
+`--fixture-mode` skips the policy requirement and labels output as test-only. It performs real static analysis on the diff without a live AI model.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `review <base> <head>` | Run a static review on a commit range |
+| `capabilities` | Show what the current runtime supports |
+| `runs` | List past runs and their status |
+| `report <run-id>` | Print the report for a completed run |
+
+### `review` options
+
+```bash
+node dist/cli/main.js review <base> <head> [options]
+
+Options:
+  --repo <path>        Repository to review (default: current directory)
+  --metadata <path>    PR metadata JSON (title, description, acceptance criteria)
+  --policy <path>      Trusted policy file (required outside --fixture-mode)
+  --store-dir <dir>    SQLite store location (default: ~/.review-copilot/)
+  --fixture-mode       Test-only run, no policy required
+  --static-only        Accept static-only results (requires --policy)
+  --json               Output raw JSON instead of Markdown
+  --timeout <ms>       Per-stage deadline in ms (default: 120000)
+```
+
+**Exit codes:** `0` = no blocking findings · `2` = changes required · `3` = human decision required
+
+### Using a policy file (production mode)
+
+Copy and adjust the included example:
+
+```bash
+cp example-policy.json my-policy.json
+```
+
+Then run:
+
+```bash
+node dist/cli/main.js review HEAD~3 HEAD \
+  --repo /path/to/your-repo \
+  --policy my-policy.json \
+  --static-only
+```
+
+### With PR metadata
+
+Create a JSON file:
+
+```json
+{
+  "title": "Add null check to user service",
+  "description": "Fixes crash when userId is null",
+  "acceptanceCriteria": ["Returns 400 for null userId", "Existing tests pass"]
+}
+```
+
+Pass it with `--metadata`:
+
+```bash
+node dist/cli/main.js review HEAD~1 HEAD --fixture-mode --metadata pr.json
+```
+
+### Development scripts
+
+```bash
+npm test              # run all tests (Vitest)
+npm run test:watch    # rerun on file change
+npm run typecheck     # type-check without emitting
+npm run lint          # ESLint
+```
 
 ---
 
