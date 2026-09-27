@@ -1,22 +1,25 @@
-/**
- * review/service.ts — ReviewServicesPort implementation.
- *
- * This is the entry point that ABY's coordinator calls.
- * It wires together: brief, risk, planning, reviewers, validation, reporting.
- */
-import type {
+import { createHash, randomUUID } from "node:crypto";
+import {
   ReviewBrief,
   RiskAssessment,
   ReviewPlan,
   CandidateFinding,
   Finding,
-  ReviewReport,
   EvidenceRecord,
+  type ReviewReport,
 } from "../contracts/index.js";
-import type { ReviewServicesPort, ReviewContext } from "../ports/review-services.js";
-import type { RepositoryPort, EvidencePort } from "../ports/repository.js";
+import type {
+  ReviewServicesPort,
+  ReviewContext,
+} from "../ports/review-services.js";
+import type {
+  RepositoryPort,
+  EvidencePort,
+} from "../ports/repository.js";
 import type { ModelPort } from "../ports/model.js";
 import type { VerificationPort } from "../ports/verification.js";
+import type { StorePort } from "../ports/store.js";
+import { redactSecrets } from "../platform/redaction.js";
 
 import { buildReviewBrief } from "./intent/brief-builder.js";
 import { buildRiskAssessment } from "./risk/assessor.js";
@@ -26,72 +29,162 @@ import { impactReviewer } from "./reviewers/impact.js";
 import { testsReviewer } from "./reviewers/tests.js";
 import { standardsReviewer } from "./reviewers/standards.js";
 import { securityReviewer } from "./reviewers/security.js";
-import type { ReviewerInput } from "./reviewers/types.js";
+import type {
+  ReviewerOutput,
+  SpecialistReviewer,
+} from "./reviewers/types.js";
 import { validateFindings } from "./validation/validator.js";
 import { buildReviewReport } from "./conclusions/builder.js";
-import { randomUUID } from "crypto";
-
-function nowISO(): string {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
-}
 
 export interface ReviewServiceDeps {
   repository: RepositoryPort;
   evidence: EvidencePort;
   model: ModelPort | null;
   verification: VerificationPort | null;
+  store: StorePort;
 }
 
+interface ContextData {
+  contents: Record<string, string>;
+  diffs: Record<string, string>;
+  unavailable: string[];
+}
+
+const reviewers: Partial<Record<string, SpecialistReviewer>> = {
+  correctness: correctnessReviewer,
+  impact: impactReviewer,
+  tests: testsReviewer,
+  standards: standardsReviewer,
+  security: securityReviewer,
+};
+
 export class ReviewService implements ReviewServicesPort {
-  private readonly deps: ReviewServiceDeps;
+  constructor(private readonly deps: ReviewServiceDeps) {}
 
-  constructor(deps: ReviewServiceDeps) {
-    this.deps = deps;
-  }
-
-  async buildBrief(context: ReviewContext, prMetadataRaw: unknown): Promise<ReviewBrief> {
-    const { snapshot, policy } = context;
-
-    // Load file contents and diffs for context-bounded files
+  private async loadContext(context: ReviewContext): Promise<ContextData> {
     const contents: Record<string, string> = {};
     const diffs: Record<string, string> = {};
+    const unavailable: string[] = [];
 
-    for (const file of snapshot.changedFiles.slice(0, policy.maxContextFiles)) {
-      const [content, diff] = await Promise.all([
-        this.deps.repository.readFile(snapshot.snapshotId, file.path),
-        this.deps.repository.getFileDiff(snapshot.snapshotId, file.path),
-      ]);
-      if (content !== null) contents[file.path] = content;
-      if (diff !== null) diffs[file.path] = diff;
+    const selected = context.snapshot.changedFiles.slice(
+      0,
+      context.policy.maxContextFiles,
+    );
+
+    for (const file of selected) {
+      try {
+        if (file.changeKind !== "deleted") {
+          const content = await this.deps.repository.readFile(
+            context.snapshot.snapshotId,
+            file.path,
+          );
+
+          if (content === null) {
+            unavailable.push(`${file.path}: text content unavailable`);
+          } else {
+            contents[file.path] = content;
+          }
+        }
+
+        const diff = await this.deps.repository.getFileDiff(
+          context.snapshot.snapshotId,
+          file.path,
+        );
+
+        if (diff === null) {
+          unavailable.push(`${file.path}: diff unavailable`);
+        } else {
+          diffs[file.path] = diff;
+        }
+      } catch {
+        unavailable.push(`${file.path}: repository read failed`);
+      }
     }
 
-    return buildReviewBrief({
+    return { contents, diffs, unavailable };
+  }
+
+  async buildBrief(
+    context: ReviewContext,
+    prMetadataRaw: unknown,
+  ): Promise<ReviewBrief> {
+    const data = await this.loadContext(context);
+
+    const brief = buildReviewBrief({
       runId: context.runId,
-      snapshot,
+      snapshot: context.snapshot,
       prMetadataRaw,
-      diffs,
-      contents,
-      maxContextFiles: policy.maxContextFiles,
-      maxFileSizeBytes: policy.maxFileSizeBytes,
+      diffs: data.diffs,
+      contents: data.contents,
+      maxContextFiles: context.policy.maxContextFiles,
+      maxFileSizeBytes: context.policy.maxFileSizeBytes,
     });
-  }
 
-  async assessRisk(context: ReviewContext, brief: ReviewBrief): Promise<RiskAssessment> {
-    const { snapshot } = context;
+    brief.missingInformation.push(...data.unavailable);
 
-    const diffs: Record<string, string> = {};
-    const contents: Record<string, string> = {};
-
-    for (const file of snapshot.changedFiles) {
-      const [content, diff] = await Promise.all([
-        this.deps.repository.readFile(snapshot.snapshotId, file.path),
-        this.deps.repository.getFileDiff(snapshot.snapshotId, file.path),
-      ]);
-      if (content !== null) contents[file.path] = content;
-      if (diff !== null) diffs[file.path] = diff;
+    if (data.unavailable.length > 0) {
+      brief.contextBounded = true;
     }
 
-    return buildRiskAssessment({ brief, snapshot, diffs, contents });
+    if (brief.acceptanceCriteria.every((criterion) => criterion.source !== "stated")) {
+      const createdAt = new Date().toISOString();
+
+      brief.humanDecisions.push({
+        schemaVersion: "1.0.0",
+        decisionId: randomUUID(),
+        runId: context.runId,
+        createdAt,
+        provenance: {
+          source: "review/service",
+          runId: context.runId,
+          createdAt,
+        },
+        kind: "ambiguous_requirement",
+        title: "Confirm acceptance criteria",
+        description:
+          "No explicit acceptance criteria were provided. Confirm the expected " +
+          "behavior before treating correctness review as complete.",
+      });
+    }
+
+    return ReviewBrief.parse(brief);
+  }
+
+  async assessRisk(
+    context: ReviewContext,
+    brief: ReviewBrief,
+  ): Promise<RiskAssessment> {
+    const data = await this.loadContext(context);
+
+    const assessment = buildRiskAssessment({
+      brief,
+      snapshot: context.snapshot,
+      diffs: data.diffs,
+      contents: data.contents,
+    });
+
+    // Do not permit LOW when relevant source was omitted or unreadable.
+    if (
+      assessment.level === "low" &&
+      (
+        brief.contextBounded ||
+        data.unavailable.length > 0 ||
+        context.snapshot.totalChangedFiles !== context.snapshot.changedFiles.length
+      )
+    ) {
+      assessment.level = "medium";
+      assessment.uncertaintyAssessment =
+        "Context is incomplete; low-risk classification is not justified.";
+    }
+
+    // Fail explicitly rather than silently ignore configured mandatory rules.
+    if (context.policy.additionalMandatoryRiskPatterns.length > 0) {
+      throw new Error(
+        "Custom mandatory risk patterns are not implemented in this static milestone",
+      );
+    }
+
+    return RiskAssessment.parse(assessment);
   }
 
   async planReview(
@@ -99,7 +192,7 @@ export class ReviewService implements ReviewServicesPort {
     brief: ReviewBrief,
     assessment: RiskAssessment,
   ): Promise<ReviewPlan> {
-    return buildReviewPlan(brief, assessment);
+    return ReviewPlan.parse(buildReviewPlan(brief, assessment));
   }
 
   async runReviewers(
@@ -107,66 +200,101 @@ export class ReviewService implements ReviewServicesPort {
     brief: ReviewBrief,
     plan: ReviewPlan,
   ): Promise<CandidateFinding[]> {
-    const { snapshot } = context;
+    const data = await this.loadContext(context);
+    const evidence: EvidenceRecord[] = [];
 
-    // Load evidence and file data once
-    const evidence = await this.deps.evidence.getEvidenceForRun(context.runId);
+    for (const file of context.snapshot.changedFiles) {
+      const diff = data.diffs[file.path];
+      if (diff === undefined) continue;
 
-    // Build or augment evidence from snapshot
-    const augmentedEvidence = await this.buildEvidenceFromSnapshot(context, snapshot, evidence);
+      const timestamp = new Date().toISOString();
+      const redacted = redactSecrets(diff);
 
-    const contents: Record<string, string> = {};
-    const diffs: Record<string, string> = {};
-    for (const file of snapshot.changedFiles) {
-      const [content, diff] = await Promise.all([
-        this.deps.repository.readFile(snapshot.snapshotId, file.path),
-        this.deps.repository.getFileDiff(snapshot.snapshotId, file.path),
-      ]);
-      if (content !== null) contents[file.path] = content;
-      if (diff !== null) diffs[file.path] = diff;
+      const record = EvidenceRecord.parse({
+        schemaVersion: "1.0.0",
+        evidenceId: randomUUID(),
+        runId: context.runId,
+        snapshotId: context.snapshot.snapshotId,
+        createdAt: timestamp,
+        provenance: {
+          source: "review/service",
+          runId: context.runId,
+          createdAt: timestamp,
+        },
+        kind: "diff_hunk",
+        path: file.path,
+        commit: context.snapshot.headCommit,
+        excerpt: redacted,
+        contentHash: createHash("sha256").update(diff).digest("hex"),
+        extractionQuality: redacted === diff ? "full" : "partial",
+        summary: redacted === diff
+          ? `Changed-file diff: ${file.path}`
+          : `Changed-file diff with secret-like text redacted: ${file.path}`,
+      });
+
+      await this.deps.evidence.storeEvidence(record);
+      evidence.push(record);
     }
 
-    const allCandidates: CandidateFinding[] = [];
+    const outputs = await Promise.all(
+      plan.assignments.map(async (assignment): Promise<ReviewerOutput> => {
+        const reviewer = reviewers[assignment.category];
 
-    for (const assignment of plan.assignments) {
-      if (assignment.status === "skipped" || assignment.status === "cancelled") continue;
+        if (!reviewer) {
+          assignment.status = "skipped";
+          assignment.exclusionReason = "Specialist is not implemented";
 
-      const reviewerInput: ReviewerInput = {
-        assignment,
-        brief,
-        contents,
-        diffs,
-        evidence: augmentedEvidence,
-        model: this.deps.model,
-        fixtureMode: context.fixtureMode,
-      };
+          return {
+            assignmentId: assignment.assignmentId,
+            candidates: [],
+            coverageNotes: [
+              `${assignment.category}: specialist not implemented`,
+            ],
+            missingCapabilities: [assignment.category],
+          };
+        }
 
-      let output;
-      switch (assignment.category) {
-        case "correctness":
-          output = await correctnessReviewer(reviewerInput);
-          break;
-        case "impact":
-          output = await impactReviewer(reviewerInput);
-          break;
-        case "tests":
-          output = await testsReviewer(reviewerInput);
-          break;
-        case "standards":
-          output = await standardsReviewer(reviewerInput);
-          break;
-        case "security":
-          output = await securityReviewer(reviewerInput);
-          break;
-        default:
-          // Specialist categories — currently unsupported in fixture mode
-          continue;
-      }
+        assignment.status = "running";
+        assignment.startedAt = new Date().toISOString();
 
-      allCandidates.push(...output.candidates);
-    }
+        try {
+          const output = await reviewer({
+            assignment,
+            brief,
+            contents: data.contents,
+            diffs: data.diffs,
+            evidence,
+            model: null,
+            fixtureMode: context.fixtureMode,
+          });
 
-    return allCandidates;
+          assignment.status = "completed";
+          assignment.completedAt = new Date().toISOString();
+
+          return {
+            ...output,
+            candidates: CandidateFinding.array().parse(output.candidates),
+          };
+        } catch {
+          assignment.status = "failed";
+          assignment.completedAt = new Date().toISOString();
+
+          return {
+            assignmentId: assignment.assignmentId,
+            candidates: [],
+            coverageNotes: [
+              `${assignment.category}: reviewer failed`,
+            ],
+            missingCapabilities: [assignment.category],
+          };
+        }
+      }),
+    );
+
+    await this.deps.store.put(context.runId, "reviewer_outputs", outputs);
+    await this.deps.store.put(context.runId, "context_gaps", data.unavailable);
+
+    return outputs.flatMap((output) => output.candidates);
   }
 
   async validateFindings(
@@ -174,24 +302,23 @@ export class ReviewService implements ReviewServicesPort {
     brief: ReviewBrief,
     candidates: CandidateFinding[],
   ): Promise<Finding[]> {
-    const { snapshot } = context;
-
-    const evidence = await this.deps.evidence.getEvidenceForRun(context.runId);
-    const contents: Record<string, string> = {};
-    for (const file of snapshot.changedFiles) {
-      const content = await this.deps.repository.readFile(snapshot.snapshotId, file.path);
-      if (content !== null) contents[file.path] = content;
-    }
+    const data = await this.loadContext(context);
 
     const result = validateFindings({
       candidates,
-      evidence,
-      snapshot,
+      evidence: await this.deps.evidence.getEvidenceForRun(context.runId),
+      snapshot: context.snapshot,
       brief,
-      contents,
+      contents: data.contents,
     });
 
-    return result.findings;
+    await this.deps.store.put(
+      context.runId,
+      "rejected_candidates",
+      result.rejected,
+    );
+
+    return Finding.array().parse(result.findings);
   }
 
   async buildReport(
@@ -201,6 +328,23 @@ export class ReviewService implements ReviewServicesPort {
     plan: ReviewPlan,
     findings: Finding[],
   ): Promise<ReviewReport> {
+    const notes = [
+      "Live model review is disabled in this static milestone.",
+      "Static pattern matches are investigation leads, not confirmed defects.",
+      "Caller tracing and approved standards-document loading are unavailable.",
+      ...brief.missingInformation,
+      ...brief.excludedFiles.map((file) => `${file.path}: ${file.reason}`),
+    ];
+
+    for (const assignment of plan.assignments) {
+      if (assignment.status !== "completed") {
+        notes.push(
+          `${assignment.category}: ${assignment.status}` +
+          (assignment.exclusionReason ? ` - ${assignment.exclusionReason}` : ""),
+        );
+      }
+    }
+
     return buildReviewReport({
       runId: context.runId,
       snapshot: context.snapshot,
@@ -208,46 +352,15 @@ export class ReviewService implements ReviewServicesPort {
       assessment,
       plan,
       findings,
-      verificationRecords: [],
+      verificationRecords: [{
+        commandId: "sandbox-verification",
+        outcome: "unavailable",
+        failureKind: "unavailable_execution",
+        attributionNote: "No reviewed code was executed",
+      }],
       modelTraceability: [],
       fixtureMode: context.fixtureMode,
-      coverageNotes: [],
+      coverageNotes: notes,
     });
-  }
-
-  private async buildEvidenceFromSnapshot(
-    context: ReviewContext,
-    snapshot: typeof context.snapshot,
-    existing: EvidenceRecord[],
-  ): Promise<EvidenceRecord[]> {
-    const augmented = [...existing];
-
-    for (const file of snapshot.changedFiles) {
-      const hasEvidence = existing.some((e) => e.path === file.path);
-      if (!hasEvidence) {
-        const diff = await this.deps.repository.getFileDiff(snapshot.snapshotId, file.path);
-        const ev: EvidenceRecord = {
-          schemaVersion: "1.0.0",
-          evidenceId: randomUUID(),
-          runId: context.runId,
-          snapshotId: snapshot.snapshotId,
-          createdAt: nowISO(),
-          provenance: {
-            source: "review/service",
-            runId: context.runId,
-            createdAt: nowISO(),
-          },
-          kind: "diff_hunk",
-          path: file.path,
-          commit: snapshot.headCommit,
-          excerpt: diff?.slice(0, 500),
-          summary: `Diff for ${file.path} (+${file.linesAdded}/-${file.linesRemoved})`,
-        };
-        augmented.push(ev);
-        await this.deps.evidence.storeEvidence(ev);
-      }
-    }
-
-    return augmented;
   }
 }

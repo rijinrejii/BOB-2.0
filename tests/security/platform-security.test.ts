@@ -9,6 +9,7 @@
  * - Unavailable isolation remains unavailable
  */
 import { describe, it, expect } from "vitest";
+import { randomUUID } from "crypto";
 import { GitAdapter, GitInputError } from "../../src/adapters/git/git-adapter.js";
 import { UnavailableExecutionAdapter } from "../../src/adapters/execution/unavailable-execution-adapter.js";
 import { loadPolicy, PolicyLoadError } from "../../src/platform/policy.js";
@@ -18,31 +19,31 @@ describe("Hostile revision inputs are rejected", () => {
   const adapter = new GitAdapter({ repoPath: resolve(process.cwd()) });
 
   it("rejects option-like revision (--option)", async () => {
-    await expect(adapter.createSnapshot("r1", "--option", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "--option", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects revision with shell special chars ($)", async () => {
-    await expect(adapter.createSnapshot("r1", "$HOME", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "$HOME", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects revision with command substitution", async () => {
-    await expect(adapter.createSnapshot("r1", "$(id)", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "$(id)", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects revision with semicolon injection", async () => {
-    await expect(adapter.createSnapshot("r1", "HEAD;ls", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "HEAD;ls", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects revision with backtick injection", async () => {
-    await expect(adapter.createSnapshot("r1", "`id`", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "`id`", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects empty revision", async () => {
-    await expect(adapter.createSnapshot("r1", "", "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "", "HEAD")).rejects.toThrow(GitInputError);
   });
 
   it("rejects overly long revision (>256 chars)", async () => {
-    await expect(adapter.createSnapshot("r1", "a".repeat(257), "HEAD")).rejects.toThrow(GitInputError);
+    await expect(adapter.createSnapshot(randomUUID(), "a".repeat(257), "HEAD")).rejects.toThrow(GitInputError);
   });
 });
 
@@ -50,22 +51,22 @@ describe("Hostile path inputs are rejected", () => {
   const adapter = new GitAdapter({ repoPath: resolve(process.cwd()) });
 
   it("rejects absolute path starting with /", async () => {
-    const snap = await adapter.createSnapshot("path-test-1", "HEAD", "HEAD");
+    const snap = await adapter.createSnapshot(randomUUID(), "HEAD", "HEAD");
     await expect(adapter.readFile(snap.snapshotId, "/etc/passwd")).rejects.toThrow(GitInputError);
   });
 
   it("rejects Windows absolute path with drive letter", async () => {
-    const snap = await adapter.createSnapshot("path-test-2", "HEAD", "HEAD");
+    const snap = await adapter.createSnapshot(randomUUID(), "HEAD", "HEAD");
     await expect(adapter.readFile(snap.snapshotId, "C:/Windows/system.ini")).rejects.toThrow(GitInputError);
   });
 
   it("rejects path traversal with ..", async () => {
-    const snap = await adapter.createSnapshot("path-test-3", "HEAD", "HEAD");
+    const snap = await adapter.createSnapshot(randomUUID(), "HEAD", "HEAD");
     await expect(adapter.readFile(snap.snapshotId, "../../etc/hosts")).rejects.toThrow(GitInputError);
   });
 
   it("rejects path with NUL byte", async () => {
-    const snap = await adapter.createSnapshot("path-test-4", "HEAD", "HEAD");
+    const snap = await adapter.createSnapshot(randomUUID(), "HEAD", "HEAD");
     await expect(adapter.readFile(snap.snapshotId, "file\0injected")).rejects.toThrow(GitInputError);
   });
 });

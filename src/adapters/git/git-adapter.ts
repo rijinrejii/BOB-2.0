@@ -1,73 +1,23 @@
-/**
- * adapters/git/git-adapter.ts
- *
- * Immutable Git access. Reads Git objects directly; never checks out
- * repository content to the working tree.
- *
- * Security invariants:
- * - All revision inputs are validated before use.
- * - Process argument arrays only; no shell interpolation.
- * - Git hooks, text conv, and external diffs are disabled.
- * - Output is bounded; processes are time-limited.
- * - Binary files and oversized files are explicitly excluded.
- * - Symlinks in paths are not followed via the host filesystem.
- * - Submodule traversal is not performed.
- */
-import { spawnSync, SpawnSyncOptions } from "child_process";
-import { createHash } from "crypto";
-import { randomUUID } from "crypto";
-
-import type { RepositoryPort, EvidencePort } from "../../ports/repository.js";
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type {
+  RepositoryPort,
+  EvidencePort,
+} from "../../ports/repository.js";
+import {
   RepositorySnapshot,
-  FileEntry,
-  EvidenceRecord,
-  FileChangeKind,
+  type EvidenceRecord,
+  type FileEntry,
+  type FileChangeKind,
 } from "../../contracts/index.js";
 
-const SCHEMA_VERSION = "1.0.0" as const;
-
-/** Maximum bytes read from a single git-show output */
-const MAX_FILE_BYTES = 500_000;
-/** Maximum bytes read from a diff output */
+const TIMEOUT_MS = 30_000;
 const MAX_DIFF_BYTES = 1_000_000;
-/** Process timeout in milliseconds */
-const GIT_TIMEOUT_MS = 30_000;
-/** Maximum characters for a revision segment (not a full SHA) */
-const MAX_REV_LENGTH = 256;
 
-/**
- * Validate a revision string. Accepts full or abbreviated commit SHAs and
- * branch/tag names (no leading dashes to prevent option injection).
- */
-function validateRevision(rev: string): void {
-  if (!rev || rev.length > MAX_REV_LENGTH) {
-    throw new GitInputError(`Revision is empty or too long: ${JSON.stringify(rev)}`);
-  }
-  if (rev.startsWith("-")) {
-    throw new GitInputError(`Revision looks like a flag (starts with '-'): ${JSON.stringify(rev)}`);
-  }
-  // Accept hex SHAs, and typical ref names (letters, digits, /, ., -, _)
-  if (!/^[0-9a-fA-F]{7,64}$/.test(rev) && !/^[a-zA-Z0-9_.\-/~^@{}]+$/.test(rev)) {
-    throw new GitInputError(`Revision contains disallowed characters: ${JSON.stringify(rev)}`);
-  }
-}
-
-/**
- * Validate a relative file path. Rejects absolute paths, traversal sequences,
- * and NUL bytes.
- */
-function validatePath(p: string): void {
-  if (!p || p.includes("\0")) {
-    throw new GitInputError(`Path contains NUL byte or is empty: ${JSON.stringify(p)}`);
-  }
-  if (p.startsWith("/") || /^[a-zA-Z]:/.test(p)) {
-    throw new GitInputError(`Absolute path rejected: ${JSON.stringify(p)}`);
-  }
-  if (p.includes("..")) {
-    throw new GitInputError(`Path traversal rejected: ${JSON.stringify(p)}`);
-  }
-}
+const nowISO = (): string => new Date().toISOString();
+const digest = (data: Buffer | string): string =>
+  createHash("sha256").update(data).digest("hex");
 
 export class GitInputError extends Error {
   override name = "GitInputError";
@@ -75,10 +25,11 @@ export class GitInputError extends Error {
 
 export class GitExecutionError extends Error {
   override name = "GitExecutionError";
+
   constructor(
     message: string,
-    public readonly stderr: string,
-    public readonly exitCode: number | null,
+    public readonly stderr = "",
+    public readonly exitCode: number | null = null,
   ) {
     super(message);
   }
@@ -86,349 +37,370 @@ export class GitExecutionError extends Error {
 
 export interface GitAdapterOptions {
   repoPath: string;
-  /** Maximum file size in bytes to include in context (default: 500_000) */
   maxFileSizeBytes?: number | undefined;
-  /** Maximum number of changed files to record (default: 500) */
   maxChangedFiles?: number | undefined;
 }
 
-function sha256(data: Buffer | string): string {
-  return createHash("sha256").update(data).digest("hex");
+interface Change {
+  status: string;
+  path: string;
+  oldPath?: string;
 }
 
-function nowISO(): string {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
+function validateRevision(value: string): void {
+  if (
+    !value ||
+    value.length > 256 ||
+    value.startsWith("-") ||
+    !/^[A-Za-z0-9_./~^@{}-]+$/.test(value)
+  ) {
+    throw new GitInputError("Invalid Git revision");
+  }
 }
 
-/**
- * Environment for git subprocess: disables credential prompts, hooks,
- * terminal interaction, and external network access where possible.
- */
-function gitEnv(): NodeJS.ProcessEnv {
+function validatePath(value: string): void {
+  if (
+    !value ||
+    value.includes("\0") ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:/.test(value) ||
+    value.split(/[\\/]/).some((part) => part === "..")
+  ) {
+    throw new GitInputError("Invalid repository-relative path");
+  }
+}
+
+function positiveInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new GitInputError(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+
+  // Do not inherit Git repository/configuration overrides from the caller.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
+
   return {
-    ...process.env,
+    ...env,
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_ASKPASS: "true",
-    GIT_SSH_COMMAND: "ssh -oBatchMode=yes",
-    // Disable text conversion / filters
+    GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
     GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_LITERAL_PATHSPECS: "1",
+    GIT_PAGER: "cat",
   };
 }
 
-/**
- * Run a git command. Never uses shell interpolation.
- * Returns stdout buffer or throws.
- */
 function runGit(
   repoPath: string,
   args: string[],
-  maxBytes = MAX_FILE_BYTES,
+  maxBytes = MAX_DIFF_BYTES,
 ): Buffer {
-  const opts: SpawnSyncOptions = {
-    cwd: repoPath,
-    env: gitEnv(),
-    timeout: GIT_TIMEOUT_MS,
-    maxBuffer: maxBytes + 1024,
-    // Important: no `shell` option (defaults to false)
-  };
+  const result = spawnSync(
+    "git",
+    [
+      "--no-pager",
+      "-c", "core.hooksPath=",
+      "-c", "core.fsmonitor=false",
+      "-c", "diff.external=",
+      "-c", "protocol.allow=never",
+      "-c", "submodule.recurse=false",
+      ...args,
+    ],
+    {
+      cwd: repoPath,
+      env: gitEnvironment(),
+      shell: false,
+      timeout: TIMEOUT_MS,
+      maxBuffer: maxBytes + 4096,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
 
-  // Disable hooks path by passing an explicit config override
-  const fullArgs = [
-    "-c", "core.hooksPath=",
-    "-c", "core.autocrlf=false",
-    "-c", "diff.external=",
-    "-c", "diff.textconv=",
-    ...args,
-  ];
-
-  const result = spawnSync("git", fullArgs, opts);
-
-  if (result.error) {
+  if (result.error || result.status !== 0) {
     throw new GitExecutionError(
-      `git command failed: ${result.error.message}`,
+      result.error
+        ? `Git operation failed: ${result.error.message}`
+        : `Git operation exited with status ${result.status}`,
       "",
-      null,
-    );
-  }
-  if (result.status !== 0) {
-    const stderr = result.stderr?.toString("utf8") ?? "";
-    throw new GitExecutionError(
-      `git exited with code ${result.status ?? "null"}`,
-      stderr,
       result.status,
     );
   }
 
-  const stdout = result.stdout;
-  if (!Buffer.isBuffer(stdout)) {
-    throw new GitExecutionError("git stdout was not a Buffer", "", null);
+  if (!Buffer.isBuffer(result.stdout) || result.stdout.length > maxBytes) {
+    throw new GitExecutionError("Git output exceeded its configured bound");
   }
-  return stdout;
+
+  return result.stdout;
 }
 
-/**
- * Resolve a revision to a full 40-char commit SHA.
- */
-function resolveRevision(repoPath: string, rev: string): string {
-  validateRevision(rev);
-  const out = runGit(repoPath, ["rev-parse", "--verify", `${rev}^{commit}`], 1024);
-  const sha = out.toString("utf8").trim();
-  if (!/^[0-9a-f]{40}$/.test(sha)) {
-    throw new GitExecutionError(`Unexpected rev-parse output: ${sha}`, "", null);
+function resolveCommit(repoPath: string, revision: string): string {
+  validateRevision(revision);
+
+  const sha = runGit(
+    repoPath,
+    ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`],
+    1024,
+  ).toString("utf8").trim();
+
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) {
+    throw new GitExecutionError("Git did not return a full commit hash");
   }
+
   return sha;
 }
 
-/**
- * Compute the merge base of two commits.
- * Throws if the merge base cannot be found (e.g., shallow clone).
- */
-function getMergeBase(repoPath: string, base: string, head: string): string {
-  validateRevision(base);
-  validateRevision(head);
-  const out = runGit(repoPath, ["merge-base", base, head], 1024);
-  const sha = out.toString("utf8").trim();
-  if (!/^[0-9a-f]{40}$/.test(sha)) {
-    throw new GitExecutionError(`Unexpected merge-base output: ${sha}`, "", null);
+function comparisonBase(
+  repoPath: string,
+  baseCommit: string,
+  headCommit: string,
+): string {
+  const values = runGit(
+    repoPath,
+    ["merge-base", "--all", baseCommit, headCommit],
+    4096,
+  ).toString("utf8").trim().split(/\s+/);
+
+  if (
+    values.length !== 1 ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(values[0] ?? "")
+  ) {
+    throw new GitExecutionError(
+      "A single merge base is required; missing or ambiguous history",
+    );
   }
-  return sha;
+
+  return values[0]!;
 }
 
-interface RawFileChange {
-  path: string;
-  oldPath?: string | undefined;
-  status: string;
-}
+function parseChanges(output: Buffer): Change[] {
+  const fields = output.toString("utf8").split("\0");
+  if (fields.at(-1) === "") fields.pop();
 
-/**
- * Parse the output of `git diff --name-status` into structured entries.
- */
-function parseDiffNameStatus(output: string): RawFileChange[] {
-  const changes: RawFileChange[] = [];
-  for (const line of output.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const parts = trimmed.split("\t");
-    const statusCode = parts[0] ?? "";
+  const changes: Change[] = [];
+  let index = 0;
 
-    if (statusCode.startsWith("R") || statusCode.startsWith("C")) {
-      // Rename or copy: R100\told-path\tnew-path
-      const oldPath = parts[1] ?? "";
-      const newPath = parts[2] ?? "";
-      if (oldPath && newPath) {
-        changes.push({ path: newPath, oldPath, status: statusCode[0] ?? "R" });
+  while (index < fields.length) {
+    const status = fields[index++];
+    const firstPath = fields[index++];
+
+    if (!status || firstPath === undefined) {
+      throw new GitExecutionError("Malformed Git name-status output");
+    }
+
+    validatePath(firstPath);
+
+    if (/^[RC]\d+$/.test(status)) {
+      const newPath = fields[index++];
+
+      if (newPath === undefined) {
+        throw new GitExecutionError("Malformed Git rename/copy output");
       }
+
+      validatePath(newPath);
+      changes.push({ status, path: newPath, oldPath: firstPath });
     } else {
-      const filePath = parts[1] ?? "";
-      if (filePath) {
-        changes.push({ path: filePath, status: statusCode });
+      if (!/^[AMDTUXB]$/.test(status)) {
+        throw new GitExecutionError("Unsupported Git change status");
       }
+
+      changes.push({ status, path: firstPath });
     }
   }
+
   return changes;
 }
 
-/**
- * Determine FileChangeKind from git status code.
- */
-function toChangeKind(status: string): FileChangeKind {
-  const first = status[0] ?? "";
-  switch (first) {
-    case "A": return "added";
-    case "D": return "deleted";
-    case "R": return "renamed";
-    case "C": return "added"; // copy treated as add for review purposes
-    default: return "modified";
-  }
+function kind(status: string): FileChangeKind {
+  if (status.startsWith("R")) return "renamed";
+  if (status.startsWith("A") || status.startsWith("C")) return "added";
+  if (status.startsWith("D")) return "deleted";
+  return "modified";
 }
 
-/**
- * Check whether an object is binary (null byte in first 8 KB).
- */
-function isBinary(buf: Buffer): boolean {
-  const check = buf.slice(0, 8192);
-  return check.includes(0);
-}
-
-/**
- * Get file size at a commit (0 if deleted, -1 if unresolvable).
- */
-function getObjectSize(repoPath: string, commit: string, filePath: string): number {
-  try {
-    validatePath(filePath);
-    const out = runGit(
-      repoPath,
-      ["cat-file", "-s", `${commit}:${filePath}`],
-      256,
-    );
-    return parseInt(out.toString("utf8").trim(), 10);
-  } catch {
-    return -1;
-  }
-}
-
-/**
- * Get line counts from a diff output.
- */
-function countDiffLines(diff: string): { added: number; removed: number } {
+function countLines(diff: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
+  let inHunk = false;
+
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+") && !line.startsWith("+++")) added++;
-    else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+    if (line.startsWith("@@ ")) {
+      inHunk = true;
+      continue;
+    }
+
+    if (line.startsWith("diff --git ")) {
+      inHunk = false;
+      continue;
+    }
+
+    if (!inHunk) continue;
+    if (line.startsWith("+")) added++;
+    if (line.startsWith("-")) removed++;
   }
+
   return { added, removed };
 }
 
-interface GitAdapterConfig {
-  repoPath: string;
-  maxFileSizeBytes: number;
-  maxChangedFiles: number;
-}
-
 export class GitAdapter implements RepositoryPort, EvidencePort {
-  private readonly opts: GitAdapterConfig;
-  private evidenceStore = new Map<string, EvidenceRecord>();
-  private snapshotCache = new Map<string, RepositorySnapshot>();
+  private readonly repoPath: string;
+  private readonly maxFileSizeBytes: number;
+  private readonly maxChangedFiles: number;
+
+  private readonly snapshots = new Map<string, RepositorySnapshot>();
+  private readonly changes = new Map<string, Change[]>();
+  private readonly evidence = new Map<string, EvidenceRecord>();
 
   constructor(options: GitAdapterOptions) {
-    this.opts = {
-      maxFileSizeBytes: options.maxFileSizeBytes ?? MAX_FILE_BYTES,
-      maxChangedFiles: options.maxChangedFiles ?? 500,
-      repoPath: options.repoPath,
+    this.repoPath = realpathSync(options.repoPath);
+    this.maxFileSizeBytes = positiveInteger(
+      options.maxFileSizeBytes ?? 500_000,
+      "maxFileSizeBytes",
+    );
+    this.maxChangedFiles = positiveInteger(
+      options.maxChangedFiles ?? 500,
+      "maxChangedFiles",
+    );
+  }
+
+  resolveRevisions(
+    baseRevision: string,
+    headRevision: string,
+  ): { baseCommit: string; headCommit: string; repositoryPath: string } {
+    return {
+      baseCommit: resolveCommit(this.repoPath, baseRevision),
+      headCommit: resolveCommit(this.repoPath, headRevision),
+      repositoryPath: this.repoPath,
     };
   }
 
-  /**
-   * Create an immutable snapshot for a given base and head revision.
-   * Resolves both to full commit SHAs before any data collection.
-   */
+  private listChanges(base: string, head: string): Change[] {
+    return parseChanges(runGit(this.repoPath, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=all",
+      "--name-status",
+      "-z",
+      "--find-renames",
+      base,
+      head,
+      "--",
+    ]));
+  }
+
+  private readBlob(commit: string, path: string): Buffer | null {
+    validatePath(path);
+
+    const spec = `${commit}:${path}`;
+    const type = runGit(
+      this.repoPath,
+      ["cat-file", "-t", spec],
+      1024,
+    ).toString("utf8").trim();
+
+    if (type !== "blob") return null;
+
+    const size = Number(
+      runGit(this.repoPath, ["cat-file", "-s", spec], 1024)
+        .toString("utf8")
+        .trim(),
+    );
+
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new GitExecutionError("Invalid Git object size");
+    }
+
+    if (size > this.maxFileSizeBytes) return null;
+
+    const content = runGit(
+      this.repoPath,
+      ["cat-file", "blob", spec],
+      this.maxFileSizeBytes,
+    );
+
+    if (content.subarray(0, 8192).includes(0)) return null;
+    return content;
+  }
+
+  private diff(base: string, head: string, paths: string[]): string {
+    for (const path of paths) validatePath(path);
+
+    return runGit(this.repoPath, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=all",
+      "--find-renames",
+      "--unified=3",
+      base,
+      head,
+      "--",
+      ...paths,
+    ]).toString("utf8");
+  }
+
   async createSnapshot(
     runId: string,
-    baseRev: string,
-    headRev: string,
+    baseRevision: string,
+    headRevision: string,
   ): Promise<RepositorySnapshot> {
-    const { repoPath } = this.opts;
+    const { baseCommit, headCommit } =
+      this.resolveRevisions(baseRevision, headRevision);
 
-    // Resolve to full SHAs first
-    const baseCommit = resolveRevision(repoPath, baseRev);
-    const headCommit = resolveRevision(repoPath, headRev);
+    const mergeBase = comparisonBase(
+      this.repoPath,
+      baseCommit,
+      headCommit,
+    );
 
-    // Compute merge base (may throw for shallow clones)
-    let mergeBase: string;
-    try {
-      mergeBase = getMergeBase(repoPath, baseCommit, headCommit);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    const changes = this.listChanges(mergeBase, headCommit);
+
+    if (changes.length > this.maxChangedFiles) {
       throw new GitExecutionError(
-        `Cannot compute merge base for ${baseCommit}..${headCommit}: ${msg}`,
-        "",
-        null,
+        `Changed-file count exceeds the limit of ${this.maxChangedFiles}`,
       );
     }
 
-    // Get changed files between merge base and head
-    const diffOutput = runGit(
-      repoPath,
-      ["diff", "--name-status", "-z", mergeBase, headCommit],
-      MAX_DIFF_BYTES,
-    );
+    const changedFiles: FileEntry[] = changes.map((change) => {
+      const changeKind = kind(change.status);
 
-    // -z separates with NUL; parse both NUL-separated and tab-separated
-    const rawText = diffOutput.toString("utf8").replace(/\0/g, "\t").replace(/\t\t/g, "\n");
-    const rawChanges = parseDiffNameStatus(rawText);
+      const head = changeKind === "deleted"
+        ? null
+        : this.readBlob(headCommit, change.path);
 
-    const limitedChanges = rawChanges.slice(0, this.opts.maxChangedFiles);
-    const truncated = rawChanges.length > this.opts.maxChangedFiles;
+      const base = changeKind === "added"
+        ? null
+        : this.readBlob(mergeBase, change.oldPath ?? change.path);
 
-    const fileEntries: FileEntry[] = [];
+      const paths = change.oldPath
+        ? [change.oldPath, change.path]
+        : [change.path];
 
-    for (const raw of limitedChanges) {
-      try {
-        validatePath(raw.path);
-      } catch {
-        // Skip unsafe paths
-        continue;
-      }
+      const counts = countLines(this.diff(mergeBase, headCommit, paths));
 
-      const changeKind = toChangeKind(raw.status);
-
-      // Get head content hash (skip for deletions)
-      let headContentHash: string | null = null;
-      let headSizeBytes: number | null = null;
-
-      if (changeKind !== "deleted") {
-        const size = getObjectSize(repoPath, headCommit, raw.path);
-        if (size > 0 && size <= this.opts.maxFileSizeBytes) {
-          try {
-            const content = runGit(
-              repoPath,
-              ["show", `${headCommit}:${raw.path}`],
-              this.opts.maxFileSizeBytes + 1024,
-            );
-            if (!isBinary(content)) {
-              headContentHash = sha256(content);
-            }
-            headSizeBytes = content.length;
-          } catch {
-            // File unreadable — record without hash
-            headSizeBytes = size;
-          }
-        } else if (size > 0) {
-          headSizeBytes = size;
-        }
-      }
-
-      // Get base content hash (skip for additions)
-      let baseContentHash: string | null = null;
-      if (changeKind !== "added") {
-        const oldPath = changeKind === "renamed" ? (raw.oldPath ?? raw.path) : raw.path;
-        const size = getObjectSize(repoPath, mergeBase, oldPath);
-        if (size > 0 && size <= this.opts.maxFileSizeBytes) {
-          try {
-            const content = runGit(
-              repoPath,
-              ["show", `${mergeBase}:${oldPath}`],
-              this.opts.maxFileSizeBytes + 1024,
-            );
-            if (!isBinary(content)) {
-              baseContentHash = sha256(content);
-            }
-          } catch {
-            // base unreadable
-          }
-        }
-      }
-
-      // Get diff for line counts
-      let linesAdded = 0;
-      let linesRemoved = 0;
-      try {
-        const diffArgs = ["diff", "--unified=0", `${mergeBase}`, `${headCommit}`, "--", raw.path];
-        const fileDiff = runGit(repoPath, diffArgs, MAX_DIFF_BYTES);
-        const counts = countDiffLines(fileDiff.toString("utf8"));
-        linesAdded = counts.added;
-        linesRemoved = counts.removed;
-      } catch {
-        // Line counts unavailable
-      }
-
-      fileEntries.push({
-        path: raw.path,
+      return {
+        path: change.path,
         changeKind,
-        headContentHash: headContentHash as `${string}` | null,
-        baseContentHash: baseContentHash as `${string}` | null,
-        headSizeBytes,
-        linesAdded,
-        linesRemoved,
-      });
-    }
+        headContentHash: head === null ? null : digest(head),
+        baseContentHash: base === null ? null : digest(base),
+        headSizeBytes: head === null ? null : head.length,
+        linesAdded: counts.added,
+        linesRemoved: counts.removed,
+      };
+    });
 
-    const digest = sha256(JSON.stringify({ fileEntries, baseCommit, headCommit, mergeBase }));
-
-    const snapshot: RepositorySnapshot = {
-      schemaVersion: SCHEMA_VERSION,
+    const snapshot = RepositorySnapshot.parse({
+      schemaVersion: "1.0.0",
       snapshotId: randomUUID(),
       runId,
       createdAt: nowISO(),
@@ -437,121 +409,133 @@ export class GitAdapter implements RepositoryPort, EvidencePort {
         runId,
         createdAt: nowISO(),
       },
-      repositoryPath: repoPath,
-      baseCommit: baseCommit as `${string}`,
-      headCommit: headCommit as `${string}`,
-      changedFiles: fileEntries,
-      totalChangedFiles: fileEntries.length + (truncated ? rawChanges.length - this.opts.maxChangedFiles : 0) as number,
-      totalLinesAdded: fileEntries.reduce((s, f) => s + f.linesAdded, 0),
-      totalLinesRemoved: fileEntries.reduce((s, f) => s + f.linesRemoved, 0),
+      repositoryPath: this.repoPath,
+      baseCommit,
+      headCommit,
+      changedFiles,
+      totalChangedFiles: changedFiles.length,
+      totalLinesAdded: changedFiles.reduce((sum, file) => sum + file.linesAdded, 0),
+      totalLinesRemoved: changedFiles.reduce((sum, file) => sum + file.linesRemoved, 0),
       immutable: true,
-      snapshotDigest: digest as `${string}`,
-    };
+      snapshotDigest: digest(JSON.stringify({
+        baseCommit,
+        headCommit,
+        mergeBase,
+        changedFiles,
+      })),
+    });
 
-    this.snapshotCache.set(runId, snapshot);
+    this.snapshots.set(snapshot.snapshotId, snapshot);
+    this.changes.set(snapshot.snapshotId, changes);
+
+    return structuredClone(snapshot);
+  }
+
+  async restoreSnapshot(value: RepositorySnapshot): Promise<void> {
+    const snapshot = RepositorySnapshot.parse(value);
+
+    if (realpathSync(snapshot.repositoryPath) !== this.repoPath) {
+      throw new GitInputError("Stored snapshot belongs to another repository");
+    }
+
+    const mergeBase = comparisonBase(
+      this.repoPath,
+      snapshot.baseCommit,
+      snapshot.headCommit,
+    );
+
+    const expectedDigest = digest(JSON.stringify({
+      baseCommit: snapshot.baseCommit,
+      headCommit: snapshot.headCommit,
+      mergeBase,
+      changedFiles: snapshot.changedFiles,
+    }));
+
+    if (expectedDigest !== snapshot.snapshotDigest) {
+      throw new GitInputError("Stored snapshot digest does not match");
+    }
+
+    this.snapshots.set(snapshot.snapshotId, structuredClone(snapshot));
+    this.changes.set(
+      snapshot.snapshotId,
+      this.listChanges(mergeBase, snapshot.headCommit),
+    );
+  }
+
+  private requireSnapshot(snapshotId: string): RepositorySnapshot {
+    const snapshot = this.snapshots.get(snapshotId);
+    if (!snapshot) throw new GitInputError("Snapshot is not loaded");
     return snapshot;
   }
 
-  // RepositoryPort implementation
-
   async getSnapshot(runId: string): Promise<RepositorySnapshot> {
-    const cached = this.snapshotCache.get(runId);
-    if (!cached) {
-      throw new Error(`No snapshot for runId ${runId}. Call createSnapshot() first.`);
-    }
-    return cached;
+    const snapshot = [...this.snapshots.values()]
+      .find((entry) => entry.runId === runId);
+
+    if (!snapshot) throw new GitInputError("Run snapshot is not loaded");
+    return structuredClone(snapshot);
   }
 
-  async readFile(snapshotId: string, filePath: string): Promise<string | null> {
-    validatePath(filePath);
-
-    const snapshot = this.findSnapshotById(snapshotId);
-    if (!snapshot) return null;
-
-    const entry = snapshot.changedFiles.find((f) => f.path === filePath);
-    if (!entry || entry.changeKind === "deleted") return null;
-
-    if (entry.headSizeBytes !== null && entry.headSizeBytes > this.opts.maxFileSizeBytes) {
-      return null; // Oversized
-    }
-
-    try {
-      const content = runGit(
-        this.opts.repoPath,
-        ["show", `${snapshot.headCommit}:${filePath}`],
-        this.opts.maxFileSizeBytes + 1024,
-      );
-      if (isBinary(content)) return null;
-      return content.toString("utf8");
-    } catch {
-      return null;
-    }
+  async readFile(snapshotId: string, path: string): Promise<string | null> {
+    const snapshot = this.requireSnapshot(snapshotId);
+    const content = this.readBlob(snapshot.headCommit, path);
+    return content === null ? null : content.toString("utf8");
   }
 
-  async readFileAtBase(snapshotId: string, filePath: string): Promise<string | null> {
-    validatePath(filePath);
+  async readFileAtBase(
+    snapshotId: string,
+    path: string,
+  ): Promise<string | null> {
+    const snapshot = this.requireSnapshot(snapshotId);
+    const change = this.changes.get(snapshotId)?.find((entry) => entry.path === path);
 
-    const snapshot = this.findSnapshotById(snapshotId);
-    if (!snapshot) return null;
+    if (change && kind(change.status) === "added") return null;
 
-    const entry = snapshot.changedFiles.find((f) => f.path === filePath);
-    if (!entry || entry.changeKind === "added") return null;
+    const base = comparisonBase(
+      this.repoPath,
+      snapshot.baseCommit,
+      snapshot.headCommit,
+    );
 
-    try {
-      const content = runGit(
-        this.opts.repoPath,
-        ["show", `${snapshot.baseCommit}:${filePath}`],
-        this.opts.maxFileSizeBytes + 1024,
-      );
-      if (isBinary(content)) return null;
-      return content.toString("utf8");
-    } catch {
-      return null;
-    }
+    const content = this.readBlob(base, change?.oldPath ?? path);
+    return content === null ? null : content.toString("utf8");
   }
 
-  async getFileDiff(snapshotId: string, filePath: string): Promise<string | null> {
-    validatePath(filePath);
+  async getFileDiff(snapshotId: string, path: string): Promise<string | null> {
+    const snapshot = this.requireSnapshot(snapshotId);
+    const change = this.changes.get(snapshotId)?.find((entry) => entry.path === path);
 
-    const snapshot = this.findSnapshotById(snapshotId);
-    if (!snapshot) return null;
+    if (!change) return null;
 
-    try {
-      const diff = runGit(
-        this.opts.repoPath,
-        ["diff", `${snapshot.baseCommit}`, `${snapshot.headCommit}`, "--", filePath],
-        MAX_DIFF_BYTES,
-      );
-      return diff.toString("utf8").slice(0, MAX_DIFF_BYTES);
-    } catch {
-      return null;
-    }
+    const base = comparisonBase(
+      this.repoPath,
+      snapshot.baseCommit,
+      snapshot.headCommit,
+    );
+
+    return this.diff(
+      base,
+      snapshot.headCommit,
+      change.oldPath ? [change.oldPath, path] : [path],
+    );
   }
 
   async getChangedFiles(snapshotId: string): Promise<FileEntry[]> {
-    const snapshot = this.findSnapshotById(snapshotId);
-    if (!snapshot) return [];
-    return snapshot.changedFiles;
+    return structuredClone(this.requireSnapshot(snapshotId).changedFiles);
   }
 
-  // EvidencePort implementation
-
   async storeEvidence(record: EvidenceRecord): Promise<void> {
-    this.evidenceStore.set(record.evidenceId, record);
+    this.evidence.set(record.evidenceId, structuredClone(record));
   }
 
   async getEvidence(evidenceId: string): Promise<EvidenceRecord | null> {
-    return this.evidenceStore.get(evidenceId) ?? null;
+    const value = this.evidence.get(evidenceId);
+    return value ? structuredClone(value) : null;
   }
 
   async getEvidenceForRun(runId: string): Promise<EvidenceRecord[]> {
-    return Array.from(this.evidenceStore.values()).filter((e) => e.runId === runId);
-  }
-
-  private findSnapshotById(snapshotId: string): RepositorySnapshot | undefined {
-    for (const snap of this.snapshotCache.values()) {
-      if (snap.snapshotId === snapshotId) return snap;
-    }
-    return undefined;
+    return structuredClone(
+      [...this.evidence.values()].filter((record) => record.runId === runId),
+    );
   }
 }

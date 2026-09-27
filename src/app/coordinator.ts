@@ -1,28 +1,15 @@
-/**
- * app/coordinator.ts
- *
- * Orchestrates the end-to-end review workflow.
- *
- * Responsibilities:
- * - Drive stage transitions: intake → ... → completed
- * - Persist validated stage output before advancing
- * - Enforce single-worker concurrency via SQLite exclusive transactions
- * - Handle recovery: load committed state, mark interrupted executions
- * - Coordinate between ABY's platform adapters and Rijin's review services
- * - Respect budget limits and cancellation
- *
- * This coordinator does NOT:
- * - Implement review reasoning (Rijin's domain)
- * - Directly access model APIs
- * - Make findings determinations
- * - Execute repository lifecycle scripts
- */
-import { randomUUID } from "crypto";
-import type { ReviewServicesPort, ReviewContext } from "../ports/review-services.js";
-import type { RepositoryPort, EvidencePort } from "../ports/repository.js";
+import type {
+  ReviewServicesPort,
+  ReviewContext,
+} from "../ports/review-services.js";
+import type {
+  RepositoryPort,
+  EvidencePort,
+} from "../ports/repository.js";
 import type { MetadataPort } from "../ports/metadata.js";
 import type { VerificationPort } from "../ports/verification.js";
-import type {
+import type { SqliteStore } from "../adapters/sqlite/sqlite-store.js";
+import {
   ReviewRun,
   RepositorySnapshot,
   CapabilityReport,
@@ -30,22 +17,23 @@ import type {
   ReviewBrief,
   RiskAssessment,
   ReviewPlan,
+  CandidateFinding,
   Finding,
   ReviewReport,
 } from "../contracts/index.js";
-import type { SqliteStore } from "../adapters/sqlite/sqlite-store.js";
-import { GitAdapter } from "../adapters/git/git-adapter.js";
-import { NEXT_STAGE, type Stage } from "./stages.js";
+import type { Stage } from "./stages.js";
 
-const SCHEMA_VERSION = "1.0.0" as const;
-
-function nowISO(): string {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
-}
+const nowISO = (): string => new Date().toISOString();
 
 export interface CoordinatorDeps {
   store: SqliteStore;
-  repository: RepositoryPort & { createSnapshot?: (runId: string, base: string, head: string) => Promise<RepositorySnapshot> };
+  repository: RepositoryPort & {
+    createSnapshot?: (
+      runId: string,
+      base: string,
+      head: string,
+    ) => Promise<RepositorySnapshot>;
+  };
   evidence: EvidencePort;
   metadata: MetadataPort;
   verification: VerificationPort;
@@ -62,7 +50,6 @@ export interface ReviewRequest {
   capabilities: CapabilityReport;
   fixtureMode: boolean;
   engineVersion: string;
-  /** Maximum time in milliseconds before the run is cancelled (default: 120_000) */
   timeoutMs?: number | undefined;
 }
 
@@ -76,392 +63,335 @@ export interface CoordinatorResult {
 }
 
 export class ReviewCoordinator {
-  private readonly deps: CoordinatorDeps;
+  private readonly active = new Set<string>();
+  private readonly cancelled = new Set<string>();
 
-  constructor(deps: CoordinatorDeps) {
-    this.deps = deps;
-  }
+  constructor(private readonly deps: CoordinatorDeps) {}
 
-  /**
-   * Execute a review from scratch or resume an interrupted run.
-   *
-   * On resume:
-   * - Loads only committed stage results
-   * - Marks abandoned running executions as interrupted
-   * - Verifies that resumable inputs still match
-   */
   async execute(request: ReviewRequest): Promise<CoordinatorResult> {
-    const { store } = this.deps;
-    const { runId } = request;
-    const timeoutMs = request.timeoutMs ?? 120_000;
-    const deadline = Date.now() + timeoutMs;
+    const { runId, fixtureMode } = request;
+    const { store, repository, reviewServices } = this.deps;
 
-    // Mark any previously interrupted runs
-    store.markInterruptedRuns(runId);
-
-    // Check for existing run
-    const existing = store.getRun(runId);
-    if (existing) {
-      return this.resume(request, existing, deadline);
-    }
-
-    // Create new run record
-    const run = this.buildRunRecord(request);
-    store.upsertRun({
-      runId: run.runId,
-      status: "running",
-      stage: "intake",
-      fixtureMode: run.fixtureMode,
-      data: run,
-    });
-    store.appendAuditLog({
-      runId,
-      eventType: "run_created",
-      actor: "coordinator",
-      payload: { baseRevision: request.baseRevision, headRevision: request.headRevision },
-    });
-
-    return this.runFromStage("intake", run, request, deadline);
-  }
-
-  private async resume(
-    request: ReviewRequest,
-    existing: ReturnType<SqliteStore["getRun"]> & object,
-    deadline: number,
-  ): Promise<CoordinatorResult> {
-    const { runId } = request;
-
-    // Terminal states — return as-is
-    if (
-      existing.status === "completed" ||
-      existing.status === "failed" ||
-      existing.status === "cancelled" ||
-      existing.status === "superseded"
-    ) {
-      const report = existing.stage === "completed" || existing.stage === "reporting"
-        ? await this.loadStoredReport(runId)
-        : null;
+    if (this.active.has(runId)) {
       return {
         runId,
-        status: existing.status,
-        stage: existing.stage,
-        report,
-        fixtureMode: existing.fixtureMode,
+        status: "conflict",
+        stage: "intake",
+        report: null,
+        fixtureMode,
+        errorMessage: "This coordinator is already processing the run",
       };
     }
 
-    // Interrupted run — verify inputs match before resuming
-    if (existing.status === "interrupted") {
-      const storedRun = existing.data as ReviewRun;
-      if (
-        storedRun.baseCommit !== request.baseRevision &&
-        storedRun.headCommit !== request.headRevision
-      ) {
-        this.deps.store.upsertRun({
-          runId,
-          status: "failed",
-          stage: existing.stage,
-          fixtureMode: existing.fixtureMode,
-          data: Object.assign({}, existing.data as object, { errorMessage: "Resume inputs do not match committed state" }),
-        });
+    const timeoutMs = request.timeoutMs ?? 120_000;
+
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("timeoutMs must be a positive integer");
+    }
+
+    if (
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(request.baseRevision) ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(request.headRevision)
+    ) {
+      throw new Error("Coordinator requires resolved full commit hashes");
+    }
+
+    TrustedPolicy.parse(request.policy);
+    CapabilityReport.parse(request.capabilities);
+
+    const identity = {
+      repositoryPath: request.repositoryPath,
+      baseCommit: request.baseRevision,
+      headCommit: request.headRevision,
+      policyContentHash: request.policy.contentHash,
+      fixtureMode,
+      engineVersion: request.engineVersion,
+    };
+
+    const existing = store.getRun(runId);
+
+    if (existing) {
+      const storedIdentity = await store.get(runId, "identity");
+
+      if (JSON.stringify(storedIdentity) !== JSON.stringify(identity)) {
+        throw new Error("Run identity does not match the requested inputs");
+      }
+
+      if (existing.status === "completed") {
         return {
           runId,
-          status: "failed",
-          stage: existing.stage,
-          report: null,
-          errorMessage: "Resume inputs do not match committed state",
+          status: "completed",
+          stage: "completed",
+          report: ReviewReport.parse(await store.get(runId, "report")),
           fixtureMode: existing.fixtureMode,
         };
       }
 
-      this.deps.store.appendAuditLog({
-        runId,
-        eventType: "run_resumed",
-        actor: "coordinator",
-        payload: { fromStage: existing.stage },
-      });
-
-      const run = existing.data as ReviewRun;
-      return this.runFromStage(existing.stage as Stage, run, request, deadline);
-    }
-
-    // Already running — conflict
-    return {
-      runId,
-      status: "conflict",
-      stage: existing.stage,
-      report: null,
-      errorMessage: `Run ${runId} is already running on worker ${existing.workerId ?? "unknown"}`,
-      fixtureMode: existing.fixtureMode,
-    };
-  }
-
-  private async runFromStage(
-    startStage: Stage,
-    run: ReviewRun,
-    request: ReviewRequest,
-    deadline: number,
-  ): Promise<CoordinatorResult> {
-    const { store, reviewServices, repository, evidence, metadata, verification } = this.deps;
-    const { runId } = request;
-    const context: ReviewContext = {
-      runId,
-      snapshot: null as unknown as RepositorySnapshot, // set after intake
-      capabilities: request.capabilities,
-      policy: request.policy,
-      fixtureMode: request.fixtureMode,
-    };
-
-    let currentStage: Stage = startStage;
-    let snapshot: RepositorySnapshot | null = null;
-    let brief: ReviewBrief | null = null;
-    let assessment: RiskAssessment | null = null;
-    let plan: ReviewPlan | null = null;
-    let findings: Finding[] | null = null;
-    let report: ReviewReport | null = null;
-
-    // Load previously committed stage results for resume
-    if (startStage !== "intake") {
-      snapshot = await this.loadStored<RepositorySnapshot>(runId, "snapshot");
-      if (snapshot) context.snapshot = snapshot;
-    }
-    if (["planning", "review", "validation", "verification", "reporting", "completed"].includes(startStage)) {
-      brief = await this.loadStored<ReviewBrief>(runId, "brief");
-      assessment = await this.loadStored<RiskAssessment>(runId, "assessment");
-    }
-    if (["review", "validation", "verification", "reporting", "completed"].includes(startStage)) {
-      plan = await this.loadStored<ReviewPlan>(runId, "plan");
-    }
-    if (["verification", "reporting", "completed"].includes(startStage)) {
-      findings = await this.loadStored<Finding[]>(runId, "findings");
-    }
-
-    const stageOrder: Stage[] = [
-      "intake", "context_collection", "risk_assessment", "planning",
-      "review", "validation", "verification", "reporting", "completed",
-    ];
-
-    for (let i = stageOrder.indexOf(startStage); i < stageOrder.length; i++) {
-      const stage = stageOrder[i];
-      if (!stage) break;
-
-      if (Date.now() > deadline) {
-        store.upsertRun({ runId, status: "failed", stage: currentStage, fixtureMode: run.fixtureMode, data: run });
-        store.appendAuditLog({ runId, eventType: "run_timeout", actor: "coordinator", payload: { stage: currentStage } });
-        return { runId, status: "failed", stage: currentStage, report: null, errorMessage: "Run timed out", fixtureMode: run.fixtureMode };
-      }
-
-      try {
-        switch (stage) {
-          case "intake": {
-            // Resolve snapshot from Git
-            let snap: RepositorySnapshot;
-            if (repository instanceof GitAdapter) {
-              snap = await repository.createSnapshot(runId, request.baseRevision, request.headRevision);
-            } else if ("createSnapshot" in repository && typeof repository.createSnapshot === "function") {
-              snap = await repository.createSnapshot(runId, request.baseRevision, request.headRevision);
-            } else {
-              snap = await repository.getSnapshot(runId);
-            }
-            snapshot = snap;
-            context.snapshot = snap;
-            await store.put(runId, "snapshot", snap);
-            this.advanceStage(store, run, "intake", "context_collection", runId);
-            currentStage = "context_collection";
-            break;
-          }
-
-          case "context_collection": {
-            // Load PR metadata if specified
-            let prMetadata: unknown = null;
-            if (request.prMetadataPath) {
-              prMetadata = await metadata.loadRaw(request.prMetadataPath);
-            }
-            await store.put(runId, "pr_metadata", prMetadata ?? {});
-            this.advanceStage(store, run, "context_collection", "risk_assessment", runId);
-            currentStage = "risk_assessment";
-            break;
-          }
-
-          case "risk_assessment": {
-            if (!snapshot) throw new Error("Snapshot not available for risk_assessment");
-            const prMetadata = await this.loadStored<unknown>(runId, "pr_metadata");
-            brief = await reviewServices.buildBrief(context, prMetadata ?? {});
-            await store.put(runId, "brief", brief);
-            assessment = await reviewServices.assessRisk(context, brief);
-            await store.put(runId, "assessment", assessment);
-            this.advanceStage(store, run, "risk_assessment", "planning", runId);
-            currentStage = "planning";
-            break;
-          }
-
-          case "planning": {
-            if (!brief || !assessment) throw new Error("Brief or assessment not available for planning");
-            plan = await reviewServices.planReview(context, brief, assessment);
-            await store.put(runId, "plan", plan);
-            this.advanceStage(store, run, "planning", "review", runId);
-            currentStage = "review";
-            break;
-          }
-
-          case "review": {
-            if (!brief || !plan) throw new Error("Brief or plan not available for review");
-            const candidates = await reviewServices.runReviewers(context, brief, plan);
-            await store.put(runId, "candidates", candidates);
-            this.advanceStage(store, run, "review", "validation", runId);
-            currentStage = "validation";
-            break;
-          }
-
-          case "validation": {
-            if (!brief) throw new Error("Brief not available for validation");
-            const candidates = await this.loadStored<import("../contracts/index.js").CandidateFinding[]>(runId, "candidates") ?? [];
-            findings = await reviewServices.validateFindings(context, brief, candidates);
-            await store.put(runId, "findings", findings);
-            this.advanceStage(store, run, "validation", "verification", runId);
-            currentStage = "verification";
-            break;
-          }
-
-          case "verification": {
-            // Static-only mode by default. Verification is recorded as unavailable
-            // when no isolation boundary is configured.
-            void verification; // Used by the report builder via findings
-            this.advanceStage(store, run, "verification", "reporting", runId);
-            currentStage = "reporting";
-            break;
-          }
-
-          case "reporting": {
-            if (!brief || !assessment || !plan || !findings) {
-              throw new Error("Required stage results not available for reporting");
-            }
-            report = await reviewServices.buildReport(context, brief, assessment, plan, findings);
-            await store.put(runId, "report", report);
-            // Advance to completed stage and set status = "completed"
-            const now = nowISO();
-            const updatedRun: ReviewRun = {
-              ...run,
-              updatedAt: now,
-              stageCheckpoints: { ...run.stageCheckpoints, reporting: now },
-            };
-            store.upsertRun({ runId, status: "completed", stage: "completed", fixtureMode: run.fixtureMode, data: updatedRun });
-            currentStage = "completed";
-            store.appendAuditLog({ runId, eventType: "run_completed", actor: "coordinator", payload: { reportId: report.reportId } });
-            break;
-          }
-
-          case "completed": {
-            // Nothing to do — already at terminal stage
-            break;
-          }
-        }
-      } catch (err) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        store.upsertRun({
-          runId,
-          status: "failed",
-          stage: currentStage,
-          fixtureMode: run.fixtureMode,
-          data: { ...run, errorMessage },
-        });
-        store.appendAuditLog({
-          runId,
-          eventType: "stage_failed",
-          actor: "coordinator",
-          payload: { stage: currentStage, error: errorMessage },
-        });
+      if (existing.status === "cancelled") {
         return {
           runId,
-          status: "failed",
-          stage: currentStage,
+          status: "cancelled",
+          stage: existing.stage,
           report: null,
-          errorMessage,
-          fixtureMode: run.fixtureMode,
+          fixtureMode: existing.fixtureMode,
+          errorMessage: "Cancelled runs are not automatically restarted",
         };
       }
     }
 
-    return {
-      runId,
-      status: "completed",
-      stage: "completed",
-      report,
-      fixtureMode: run.fixtureMode,
-    };
-  }
+    this.active.add(runId);
+    this.cancelled.delete(runId);
 
-  private advanceStage(
-    store: SqliteStore,
-    run: ReviewRun,
-    fromStage: string,
-    toStage: string,
-    runId: string,
-  ): void {
-    const now = nowISO();
-    const updatedRun: ReviewRun = {
-      ...run,
-      updatedAt: now,
-      stageCheckpoints: {
-        ...run.stageCheckpoints,
-        [fromStage]: now,
-      },
-    };
+    const deadline = Date.now() + timeoutMs;
+    let stage: Stage = "intake";
+    const createdAt = nowISO();
 
-    store.upsertRun({
+    let run = ReviewRun.parse({
+      schemaVersion: "1.0.0",
       runId,
-      status: "running",
-      stage: toStage,
-      fixtureMode: run.fixtureMode,
-      data: updatedRun,
-    });
-    store.appendAuditLog({
-      runId,
-      eventType: "stage_advanced",
-      actor: "coordinator",
-      payload: { fromStage, toStage },
-    });
-  }
-
-  private buildRunRecord(request: ReviewRequest): ReviewRun {
-    const now = nowISO();
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      runId: request.runId,
-      createdAt: now,
-      updatedAt: now,
+      createdAt,
+      updatedAt: createdAt,
       provenance: {
         source: "coordinator",
-        runId: request.runId,
-        createdAt: now,
+        runId,
+        createdAt,
       },
       repositoryPath: request.repositoryPath,
-      baseCommit: request.baseRevision as `${string}`,
-      headCommit: request.headRevision as `${string}`,
-      prMetadataPath: request.prMetadataPath,
+      baseCommit: request.baseRevision,
+      headCommit: request.headRevision,
+      ...(request.prMetadataPath
+        ? { prMetadataPath: request.prMetadataPath }
+        : {}),
       status: "running",
-      fixtureMode: request.fixtureMode,
+      fixtureMode,
       capabilityReportId: request.capabilities.reportId,
       stageCheckpoints: {},
+    });
+
+    const guard = (): void => {
+      if (this.cancelled.has(runId)) {
+        throw new Error("Run cancelled");
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error("Run timed out");
+      }
     };
+
+    const checkpoint = (completed: Stage, next: Stage): void => {
+      guard();
+      const timestamp = nowISO();
+
+      run = ReviewRun.parse({
+        ...run,
+        updatedAt: timestamp,
+        stageCheckpoints: {
+          ...run.stageCheckpoints,
+          [completed]: timestamp,
+        },
+      });
+
+      stage = next;
+
+      store.upsertRun({
+        runId,
+        status: "running",
+        stage,
+        fixtureMode,
+        data: run,
+      });
+    };
+
+    try {
+      await store.put(runId, "identity", identity);
+      await store.delete(runId, "report");
+
+      store.upsertRun({
+        runId,
+        status: "running",
+        stage,
+        fixtureMode,
+        data: run,
+      });
+
+      // Mark any runs that were left in "running" state (from a previous crashed
+      // session) as "interrupted", excluding the current run.
+      store.markInterruptedRuns(runId);
+
+      store.appendAuditLog({
+        runId,
+        eventType: existing ? "run_restarted" : "run_created",
+        actor: "coordinator",
+        payload: {
+          recovery: existing
+            ? "Restart from immutable inputs; no partial-stage reuse"
+            : "New run",
+        },
+      });
+
+      guard();
+
+      const snapshot = RepositorySnapshot.parse(
+        repository.createSnapshot
+          ? await repository.createSnapshot(
+              runId,
+              request.baseRevision,
+              request.headRevision,
+            )
+          : await repository.getSnapshot(runId),
+      );
+
+      if (
+        snapshot.runId !== runId ||
+        snapshot.baseCommit !== request.baseRevision ||
+        snapshot.headCommit !== request.headRevision
+      ) {
+        throw new Error("Snapshot identity mismatch");
+      }
+
+      await store.put(runId, "snapshot", snapshot);
+      checkpoint("intake", "context_collection");
+
+      const context: ReviewContext = {
+        runId,
+        snapshot,
+        policy: request.policy,
+        capabilities: request.capabilities,
+        fixtureMode,
+      };
+
+      const metadata = request.prMetadataPath
+        ? await this.deps.metadata.loadRaw(request.prMetadataPath)
+        : {};
+
+      await store.put(runId, "pr_metadata", metadata ?? {});
+      checkpoint("context_collection", "risk_assessment");
+
+      const brief = ReviewBrief.parse(
+        await reviewServices.buildBrief(context, metadata ?? {}),
+      );
+      guard();
+
+      const assessment = RiskAssessment.parse(
+        await reviewServices.assessRisk(context, brief),
+      );
+
+      await store.put(runId, "brief", brief);
+      await store.put(runId, "assessment", assessment);
+      checkpoint("risk_assessment", "planning");
+
+      const plan = ReviewPlan.parse(
+        await reviewServices.planReview(context, brief, assessment),
+      );
+
+      await store.put(runId, "plan", plan);
+      checkpoint("planning", "review");
+
+      const candidates = CandidateFinding.array().parse(
+        await reviewServices.runReviewers(context, brief, plan),
+      );
+
+      await store.put(runId, "candidates", candidates);
+      // ReviewService updates assignment states.
+      await store.put(runId, "plan", ReviewPlan.parse(plan));
+      checkpoint("review", "validation");
+
+      const findings = Finding.array().parse(
+        await reviewServices.validateFindings(context, brief, candidates),
+      );
+
+      await store.put(runId, "findings", findings);
+      checkpoint("validation", "verification");
+
+      // No code execution is attempted in the static milestone.
+      await store.put(runId, "verification_status", {
+        outcome: "unavailable",
+        reason: "Static-only review; no verified execution boundary",
+      });
+      checkpoint("verification", "reporting");
+
+      const report = ReviewReport.parse(
+        await reviewServices.buildReport(
+          context,
+          brief,
+          assessment,
+          plan,
+          findings,
+        ),
+      );
+
+      guard();
+
+      await store.put(runId, "report", report);
+
+      run = ReviewRun.parse({
+        ...run,
+        status: "completed",
+        updatedAt: nowISO(),
+        stageCheckpoints: {
+          ...run.stageCheckpoints,
+          reporting: nowISO(),
+        },
+      });
+
+      store.upsertRun({
+        runId,
+        status: "completed",
+        stage: "completed",
+        fixtureMode,
+        data: run,
+      });
+
+      return {
+        runId,
+        status: "completed",
+        stage: "completed",
+        report,
+        fixtureMode,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error
+        ? error.message
+        : "Unknown review failure";
+
+      const status = this.cancelled.has(runId) ? "cancelled" : "failed";
+
+      run = ReviewRun.parse({
+        ...run,
+        status,
+        updatedAt: nowISO(),
+        errorMessage,
+      });
+
+      store.upsertRun({
+        runId,
+        status,
+        stage,
+        fixtureMode,
+        data: run,
+      });
+
+      return {
+        runId,
+        status,
+        stage,
+        report: null,
+        errorMessage,
+        fixtureMode,
+      };
+    } finally {
+      this.active.delete(runId);
+      this.cancelled.delete(runId);
+    }
   }
 
-  private async loadStored<T>(runId: string, key: string): Promise<T | null> {
-    const raw = await this.deps.store.get(runId, key);
-    return raw as T | null;
-  }
-
-  private async loadStoredReport(runId: string): Promise<ReviewReport | null> {
-    return this.loadStored<ReviewReport>(runId, "report");
-  }
-
-  /**
-   * Cancel a running run.
-   */
   cancel(runId: string): void {
+    this.cancelled.add(runId);
+
+    if (this.active.has(runId)) return;
+
     const existing = this.deps.store.getRun(runId);
-    if (!existing) return;
-    if (["completed", "failed", "cancelled", "superseded"].includes(existing.status)) return;
+    if (!existing || existing.status === "completed") return;
 
     this.deps.store.upsertRun({
       runId,
@@ -470,14 +400,7 @@ export class ReviewCoordinator {
       fixtureMode: existing.fixtureMode,
       data: existing.data,
     });
-    this.deps.store.appendAuditLog({
-      runId,
-      eventType: "run_cancelled",
-      actor: "coordinator",
-      payload: {},
-    });
   }
 }
 
-// Re-export stages for external use
 export { NEXT_STAGE, type Stage } from "./stages.js";

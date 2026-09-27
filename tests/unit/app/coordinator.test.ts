@@ -165,13 +165,17 @@ function makeCoordinator(store: SqliteStore, snapshot: RepositorySnapshot) {
   });
 }
 
+// Full 40-char hex SHAs required by the coordinator's identity check.
+const BASE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEAD_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 describe("ReviewCoordinator — fixture workflow", () => {
   it("completes a fixture run end-to-end", async () => {
     const store = new SqliteStore({ databasePath: ":memory:" });
     const runId = randomUUID();
     const snapshot = makeFixtureSnapshot(runId, [
       { path: "src/example.ts", changeKind: "modified", content: "export const x = 1;", diff: "+export const x = 1;" },
-    ]);
+    ], BASE_SHA, HEAD_SHA);
     const policy = makeFixturePolicy();
     const capabilities = makeFixtureCapabilities();
     const coordinator = makeCoordinator(store, snapshot);
@@ -179,8 +183,8 @@ describe("ReviewCoordinator — fixture workflow", () => {
     const result = await coordinator.execute({
       runId,
       repositoryPath: "/fixture/repo",
-      baseRevision: "abc1234",
-      headRevision: "def5678",
+      baseRevision: BASE_SHA,
+      headRevision: HEAD_SHA,
       policy,
       capabilities,
       fixtureMode: true,
@@ -196,7 +200,7 @@ describe("ReviewCoordinator — fixture workflow", () => {
   it("persists stage checkpoints during run", async () => {
     const store = new SqliteStore({ databasePath: ":memory:" });
     const runId = randomUUID();
-    const snapshot = makeFixtureSnapshot(runId, []);
+    const snapshot = makeFixtureSnapshot(runId, [], BASE_SHA, HEAD_SHA);
     const policy = makeFixturePolicy();
     const capabilities = makeFixtureCapabilities();
     const coordinator = makeCoordinator(store, snapshot);
@@ -204,8 +208,8 @@ describe("ReviewCoordinator — fixture workflow", () => {
     await coordinator.execute({
       runId,
       repositoryPath: "/fixture/repo",
-      baseRevision: "abc1234",
-      headRevision: "def5678",
+      baseRevision: BASE_SHA,
+      headRevision: HEAD_SHA,
       policy,
       capabilities,
       fixtureMode: true,
@@ -220,14 +224,14 @@ describe("ReviewCoordinator — fixture workflow", () => {
   it("returns report from store on second call with same runId (already completed)", async () => {
     const store = new SqliteStore({ databasePath: ":memory:" });
     const runId = randomUUID();
-    const snapshot = makeFixtureSnapshot(runId, []);
+    const snapshot = makeFixtureSnapshot(runId, [], BASE_SHA, HEAD_SHA);
     const policy = makeFixturePolicy();
     const capabilities = makeFixtureCapabilities();
     const coordinator = makeCoordinator(store, snapshot);
 
-    await coordinator.execute({ runId, repositoryPath: "/fixture/repo", baseRevision: "abc1234", headRevision: "def5678", policy, capabilities, fixtureMode: true, engineVersion: "0.1.0" });
+    await coordinator.execute({ runId, repositoryPath: "/fixture/repo", baseRevision: BASE_SHA, headRevision: HEAD_SHA, policy, capabilities, fixtureMode: true, engineVersion: "0.1.0" });
     // Second call with same ID — returns completed result from store
-    const result2 = await coordinator.execute({ runId, repositoryPath: "/fixture/repo", baseRevision: "abc1234", headRevision: "def5678", policy, capabilities, fixtureMode: true, engineVersion: "0.1.0" });
+    const result2 = await coordinator.execute({ runId, repositoryPath: "/fixture/repo", baseRevision: BASE_SHA, headRevision: HEAD_SHA, policy, capabilities, fixtureMode: true, engineVersion: "0.1.0" });
     expect(result2.status).toBe("completed");
     store.close();
   });
@@ -243,7 +247,7 @@ describe("ReviewCoordinator — recovery", () => {
       status: "running",
       stage: "review",
       fixtureMode: false,
-      data: { baseCommit: "abc1234", headCommit: "def5678" },
+      data: { baseCommit: BASE_SHA, headCommit: HEAD_SHA },
     });
     store.upsertRun({
       runId: "old-run-2",
@@ -254,14 +258,14 @@ describe("ReviewCoordinator — recovery", () => {
     });
 
     const newRunId = randomUUID();
-    const snapshot = makeFixtureSnapshot(newRunId, []);
+    const snapshot = makeFixtureSnapshot(newRunId, [], BASE_SHA, HEAD_SHA);
     const coordinator = makeCoordinator(store, snapshot);
 
     await coordinator.execute({
       runId: newRunId,
       repositoryPath: "/fixture/repo",
-      baseRevision: "abc1234",
-      headRevision: "def5678",
+      baseRevision: BASE_SHA,
+      headRevision: HEAD_SHA,
       policy: makeFixturePolicy(),
       capabilities: makeFixtureCapabilities(),
       fixtureMode: true,
@@ -291,7 +295,7 @@ describe("ReviewCoordinator — timeout", () => {
   it("fails with timeout when deadline is exceeded", async () => {
     const store = new SqliteStore({ databasePath: ":memory:" });
     const runId = randomUUID();
-    const snapshot = makeFixtureSnapshot(runId, []);
+    const snapshot = makeFixtureSnapshot(runId, [], BASE_SHA, HEAD_SHA);
 
     // Slow service that takes longer than timeout
     const slowServices: ReviewServicesPort = {
@@ -323,8 +327,8 @@ describe("ReviewCoordinator — timeout", () => {
     const result = await coordinator.execute({
       runId,
       repositoryPath: "/fixture/repo",
-      baseRevision: "abc1234",
-      headRevision: "def5678",
+      baseRevision: BASE_SHA,
+      headRevision: HEAD_SHA,
       policy: makeFixturePolicy(),
       capabilities: makeFixtureCapabilities(),
       fixtureMode: true,

@@ -25,7 +25,8 @@ function makeCandidate(overrides: Partial<CandidateFinding> = {}): CandidateFind
     provenance: { source: "test", createdAt: nowISO() },
     claim: "Test finding claim",
     affectedPath: "src/service.ts",
-    headCommit: "abc1234",
+    // Matches the default headCommit used by makeFixtureSnapshot.
+    headCommit: "def5678",
     failureScenario: "User calls function with null",
     preconditions: "Input is null",
     observedBehavior: "Function throws unhandled",
@@ -244,7 +245,6 @@ describe("Scenario 9: Reviewer disagreement", () => {
     // Three reviewers produce the same claim — but model-sourced low confidence
     const modelFinding = makeCandidate({
       runId,
-      headCommit: "model-output",
       confidence: "low",
       confidenceRationale: "Model says so",
       underlyingCause: "speculative_claim",
@@ -263,9 +263,10 @@ describe("Scenario 10: Malformed model output", () => {
     const runId = randomUUID();
     const snapshot = makeSnapshot(runId);
     const brief = makeBrief(runId, snapshot);
+    // A valid UUID that simply doesn't exist in the evidence store.
     const candidate = makeCandidate({
       runId,
-      evidenceIds: ["nonexistent-uuid-1111-2222-3333-444444444444"],
+      evidenceIds: [randomUUID()],
     });
 
     const result = validateFindings({ candidates: [candidate], evidence: [], snapshot, brief, contents: {} });
@@ -467,8 +468,8 @@ describe("Scenario 18: Unresolved concerns never confirmed by wording alone", ()
     const snapshot = makeSnapshot(runId);
     const brief = makeBrief(runId, snapshot);
 
-    const wording1 = makeCandidate({ runId, headCommit: "model-output", confidence: "low", underlyingCause: "speculative_a", affectedBehavior: "behavior_a", claim: "CONFIRMED: This is definitely a bug" });
-    const wording2 = makeCandidate({ runId, headCommit: "model-output", confidence: "low", underlyingCause: "speculative_b", affectedBehavior: "behavior_b", claim: "CONFIRMED: This is definitely a bug" });
+    const wording1 = makeCandidate({ runId, confidence: "low", underlyingCause: "speculative_a", affectedBehavior: "behavior_a", claim: "CONFIRMED: This is definitely a bug" });
+    const wording2 = makeCandidate({ runId, confidence: "low", underlyingCause: "speculative_b", affectedBehavior: "behavior_b", claim: "CONFIRMED: This is definitely a bug" });
 
     const result = validateFindings({ candidates: [wording1, wording2], evidence: [], snapshot, brief, contents: {} });
 

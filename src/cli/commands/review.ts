@@ -1,15 +1,21 @@
-/**
- * cli/commands/review.ts
- *
- * `review-copilot review <base> <head>` — Run or resume a review.
- *
- * Accepts explicit local Git revisions and structured PR metadata.
- * Resolves immutable snapshots. Saves evidence and stages results transactionally.
- * Resumes interrupted runs safely.
- */
 import { Command } from "commander";
-import { resolve } from "path";
-import { loadPolicy, defaultFixturePolicy } from "../../platform/policy.js";
+import {
+  mkdirSync,
+  realpathSync,
+} from "node:fs";
+import {
+  resolve,
+  relative,
+  isAbsolute,
+  join,
+} from "node:path";
+import { homedir } from "node:os";
+import { createHash } from "node:crypto";
+
+import {
+  loadPolicy,
+  defaultFixturePolicy,
+} from "../../platform/policy.js";
 import { discoverCapabilities } from "../../platform/capabilities.js";
 import { GitAdapter } from "../../adapters/git/git-adapter.js";
 import { UnavailableExecutionAdapter } from "../../adapters/execution/unavailable-execution-adapter.js";
@@ -17,164 +23,225 @@ import { FileMetadataAdapter } from "../../adapters/metadata/file-metadata-adapt
 import { SqliteStore } from "../../adapters/sqlite/sqlite-store.js";
 import { SqliteEvidenceAdapter } from "../../adapters/sqlite/sqlite-evidence-adapter.js";
 import { ReviewCoordinator } from "../../app/coordinator.js";
+import { acquireLocalRunLock } from "../../app/local-run-lock.js";
 import { deriveRunId } from "../../app/run-identity.js";
-import { renderReportJson, renderReportMarkdown } from "../../app/report-renderer.js";
+import { renderReportMarkdown } from "../../app/report-renderer.js";
 import { ReviewService } from "../../review/service.js";
-import { UnavailableModelAdapter } from "../../adapters/models/unavailable.js";
+import {
+  Finding,
+  ReviewReport,
+} from "../../contracts/index.js";
 
-const ENGINE_VERSION = "0.1.0";
+const ENGINE_VERSION = "0.2.0-static";
+
+interface Options {
+  repo?: string;
+  metadata?: string;
+  policy?: string;
+  storeDir?: string;
+  fixtureMode?: boolean;
+  staticOnly?: boolean;
+  json?: boolean;
+  timeout?: string;
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" ||
+    (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
+}
+
+function parseTimeout(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error("--timeout must be a positive integer");
+  }
+
+  const timeout = Number(value);
+
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new Error("--timeout must be a positive integer");
+  }
+
+  return timeout;
+}
 
 export function reviewCommand(): Command {
-  const cmd = new Command("review");
-  cmd.description("Run or resume a review for a Git commit range");
-  cmd.argument("<base>", "Base revision (commit SHA, branch, or tag)");
-  cmd.argument("<head>", "Head revision (commit SHA, branch, or tag)");
-  cmd.option("--repo <path>", "Path to the Git repository (default: cwd)");
-  cmd.option("--metadata <path>", "Path to PR metadata JSON file");
-  cmd.option("--policy <path>", "Path to trusted policy JSON file");
-  cmd.option("--store-dir <dir>", "Override the store directory");
-  cmd.option("--fixture-mode", "Run in fixture mode (labeled output, no live model)", false);
-  cmd.option("--json", "Output report as JSON (default: Markdown)");
-  cmd.option("--timeout <ms>", "Run timeout in milliseconds (default: 120000)", "120000");
+  const command = new Command("review")
+    .description("Run a bounded local static review")
+    .argument("<base>", "Base revision")
+    .argument("<head>", "Head revision")
+    .option("--repo <path>", "Repository path")
+    .option("--metadata <path>", "PR metadata JSON")
+    .option("--policy <path>", "Trusted policy JSON")
+    .option("--store-dir <dir>", "Store directory outside the repository")
+    .option("--fixture-mode", "Label this run as a fixture", false)
+    .option("--static-only", "Explicitly accept static-only review", false)
+    .option("--json", "Output report and finding records as JSON")
+    .option("--timeout <ms>", "Stage-boundary deadline", "120000");
 
-  cmd.action(
-    async (
-      baseRev: string,
-      headRev: string,
-      options: {
-        repo?: string;
-        metadata?: string;
-        policy?: string;
-        storeDir?: string;
-        fixtureMode?: boolean;
-        json?: boolean;
-        timeout?: string;
-      },
-    ) => {
-      const repoPath = resolve(options.repo ?? process.cwd());
-      const fixtureMode = options.fixtureMode ?? false;
+  command.action(async (
+    baseRevision: string,
+    headRevision: string,
+    options: Options,
+  ) => {
+    if (!options.fixtureMode && !options.staticOnly) {
+      throw new Error(
+        "Live AI review is disabled. Use --static-only or --fixture-mode.",
+      );
+    }
 
-      // Load policy (fail closed if invalid)
-      let policy;
-      if (options.policy) {
-        try {
-          policy = loadPolicy(options.policy);
-        } catch (err) {
-          process.stderr.write(`Policy load failed: ${(err as Error).message}\n`);
-          process.exit(1);
-        }
-      } else if (fixtureMode) {
-        policy = defaultFixturePolicy();
-        process.stderr.write("Warning: No policy specified. Using fixture defaults (fixture mode only).\n");
-      } else {
-        process.stderr.write(
-          "Error: --policy <path> is required for production reviews. " +
-            "Pass --fixture-mode to run without a policy file.\n",
-        );
-        process.exit(1);
-      }
+    const fixtureMode = Boolean(options.fixtureMode);
+
+    if (!fixtureMode && !options.policy) {
+      throw new Error("--policy is required outside fixture mode");
+    }
+
+    const policy = options.policy
+      ? loadPolicy(options.policy)
+      : defaultFixturePolicy();
+
+    const repositoryPath = realpathSync(resolve(options.repo ?? process.cwd()));
+
+    const repository = new GitAdapter({
+      repoPath: repositoryPath,
+      maxFileSizeBytes: policy.maxFileSizeBytes,
+    });
+
+    const resolved = repository.resolveRevisions(baseRevision, headRevision);
+    const timeoutMs = parseTimeout(options.timeout ?? "120000");
+
+    const metadataAdapter = new FileMetadataAdapter();
+    const metadataValue = options.metadata
+      ? await metadataAdapter.loadRaw(resolve(options.metadata))
+      : {};
+
+    const metadataDigest = createHash("sha256")
+      .update(JSON.stringify(metadataValue ?? {}))
+      .digest("hex");
+
+    // Include review mode and metadata content, not just Git commits.
+    const effectiveInputHash = createHash("sha256")
+      .update(JSON.stringify({
+        policyHash: policy.contentHash,
+        metadataDigest,
+        fixtureMode,
+        mode: "static-only",
+      }))
+      .digest("hex");
+
+    const runId = deriveRunId({
+      repositoryPath: resolved.repositoryPath,
+      baseCommit: resolved.baseCommit,
+      headCommit: resolved.headCommit,
+      comparisonStrategy: "merge-base",
+      policyContentHash: effectiveInputHash,
+      engineVersion: ENGINE_VERSION,
+    });
+
+    const requestedStoreDir = resolve(
+      options.storeDir ??
+      process.env["REVIEW_COPILOT_STORE_DIR"] ??
+      join(homedir(), ".review-copilot"),
+    );
+
+    // Reject the obvious unsafe path before creating directories.
+    if (isWithin(repositoryPath, requestedStoreDir)) {
+      throw new Error("Review storage must be outside the reviewed repository");
+    }
+
+    mkdirSync(requestedStoreDir, { recursive: true, mode: 0o700 });
+    const storeDirectory = realpathSync(requestedStoreDir);
+
+    // Check again after resolving filesystem symlinks.
+    if (isWithin(repositoryPath, storeDirectory)) {
+      throw new Error("Review storage resolves inside the reviewed repository");
+    }
+
+    const databasePath = join(storeDirectory, "review-copilot.db");
+    const releaseLock = acquireLocalRunLock(databasePath);
+
+    let store: SqliteStore | undefined;
+
+    try {
+      store = new SqliteStore({ databasePath });
+
+      const evidence = new SqliteEvidenceAdapter(store);
+      const verification = new UnavailableExecutionAdapter();
 
       const capabilities = discoverCapabilities(policy);
+      capabilities.modelStatus = policy.externalTransmissionAllowed
+        ? "unavailable"
+        : "prohibited_by_policy";
+      capabilities.storageAvailable = true;
+      capabilities.limitations.push(
+        "Live model invocation is disabled in the static-only milestone.",
+      );
 
-      // Set up adapters
-      const dbPath = SqliteStore.resolveStorePath(options.storeDir);
-      let store: SqliteStore;
-      try {
-        store = new SqliteStore({ databasePath: dbPath });
-      } catch (err) {
-        process.stderr.write(`Store initialization failed: ${(err as Error).message}\n`);
-        process.exit(1);
-      }
-
-      const gitAdapter = new GitAdapter({
-        repoPath,
-        maxFileSizeBytes: policy.maxFileSizeBytes,
+      const service = new ReviewService({
+        repository,
+        evidence,
+        verification,
+        model: null,
+        store,
       });
-
-      const evidenceAdapter = new SqliteEvidenceAdapter(store);
-      const metadataAdapter = new FileMetadataAdapter();
-      const executionAdapter = new UnavailableExecutionAdapter();
-
-      // Determine model adapter — never silently falls back
-      const modelAdapter = capabilities.modelStatus === "available"
-        ? null // Would load OpenAI adapter here when live
-        : new UnavailableModelAdapter();
-
-      const reviewService = new ReviewService({
-        repository: gitAdapter,
-        evidence: evidenceAdapter,
-        model: modelAdapter,
-        verification: executionAdapter,
-      });
-
-      // Derive stable run ID
-      const runId = deriveRunId({
-        repositoryPath: repoPath,
-        baseCommit: baseRev,
-        headCommit: headRev,
-        comparisonStrategy: "merge-base",
-        policyContentHash: policy.contentHash,
-        engineVersion: ENGINE_VERSION,
-      });
-
-      const timeoutMs = parseInt(options.timeout ?? "120000", 10);
-
-      if (!options.json) {
-        process.stdout.write(`Starting review (run: ${runId})\n`);
-        process.stdout.write(`  Repository: ${repoPath}\n`);
-        process.stdout.write(`  Base: ${baseRev} → Head: ${headRev}\n`);
-        if (fixtureMode) process.stdout.write("  Mode: FIXTURE (no live model)\n");
-        process.stdout.write("\n");
-      }
 
       const coordinator = new ReviewCoordinator({
         store,
-        repository: gitAdapter,
-        evidence: evidenceAdapter,
-        metadata: metadataAdapter,
-        verification: executionAdapter,
-        reviewServices: reviewService,
+        repository,
+        evidence,
+        verification,
+        // Use the exact metadata already hashed for run identity.
+        metadata: {
+          loadRaw: async () => structuredClone(metadataValue),
+        },
+        reviewServices: service,
       });
 
-      let result;
-      try {
-        result = await coordinator.execute({
-          runId,
-          repositoryPath: repoPath,
-          baseRevision: baseRev,
-          headRevision: headRev,
-          prMetadataPath: options.metadata,
-          policy,
-          capabilities,
-          fixtureMode,
-          engineVersion: ENGINE_VERSION,
-          timeoutMs,
-        });
-      } catch (err) {
-        process.stderr.write(`Review execution failed: ${(err as Error).message}\n`);
-        store.close();
-        process.exit(1);
-      } finally {
-        store.close();
+      const result = await coordinator.execute({
+        runId,
+        repositoryPath: resolved.repositoryPath,
+        baseRevision: resolved.baseCommit,
+        headRevision: resolved.headCommit,
+        ...(options.metadata ? { prMetadataPath: resolve(options.metadata) } : {}),
+        policy,
+        capabilities,
+        fixtureMode,
+        engineVersion: ENGINE_VERSION,
+        timeoutMs,
+      });
+
+      if (result.status !== "completed" || !result.report) {
+        throw new Error(
+          result.errorMessage ?? `Review ended with status ${result.status}`,
+        );
       }
 
-      if (result.status === "failed") {
-        process.stderr.write(`Review failed at stage ${result.stage}: ${result.errorMessage ?? "unknown error"}\n`);
-        process.exit(1);
-      }
-
-      if (!result.report) {
-        process.stderr.write(`Review did not produce a report (status: ${result.status}, stage: ${result.stage})\n`);
-        process.exit(1);
-      }
+      const report = ReviewReport.parse(result.report);
+      const findings = Finding.array().parse(
+        await store.get(runId, "findings") ?? [],
+      );
 
       if (options.json) {
-        process.stdout.write(renderReportJson(result.report) + "\n");
+        process.stdout.write(JSON.stringify({ report, findings }, null, 2) + "\n");
       } else {
-        process.stdout.write(renderReportMarkdown(result.report));
+        process.stdout.write(renderReportMarkdown(report, findings));
       }
-    },
-  );
 
-  return cmd;
+      // Distinguish an executed but incomplete review from a clean result.
+      process.exitCode = report.conclusions.includes("changes_required")
+        ? 2
+        : report.conclusions.includes("incomplete") ||
+            report.conclusions.includes("human_decision_required")
+          ? 3
+          : 0;
+    } finally {
+      try {
+        store?.close();
+      } finally {
+        releaseLock();
+      }
+    }
+  });
+
+  return command;
 }

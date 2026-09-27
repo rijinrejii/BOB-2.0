@@ -1,123 +1,128 @@
-/**
- * app/report-renderer.ts
- *
- * Renders a ReviewReport to JSON and Markdown.
- *
- * Serializes from the validated ReviewReport struct only.
- * Does NOT independently recompute findings.
- *
- * Output rules:
- * - Never prints an approval signal or claims proof of correctness.
- * - Fixture mode is prominently labeled.
- * - Coverage limitations are listed.
- * - Check states and outcomes are reported as-is.
- */
-import type { ReviewReport } from "../contracts/index.js";
+import {
+  ReviewReport,
+  Finding,
+} from "../contracts/index.js";
+import { redactSecrets } from "../platform/redaction.js";
 
-/**
- * Render a ReviewReport to a JSON string.
- * The report is serialized exactly — no recomputation.
- */
-export function renderReportJson(report: ReviewReport): string {
-  return JSON.stringify(report, null, 2);
+function safeText(value: string): string {
+  return redactSecrets(value)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/([\\`*_[\]{}])/g, "\\$1");
 }
 
-/**
- * Render a ReviewReport to a Markdown string.
- * Human-readable format for CLI output and local documentation.
- */
-export function renderReportMarkdown(report: ReviewReport): string {
-  const lines: string[] = [];
+export function renderReportJson(report: ReviewReport): string {
+  return JSON.stringify(ReviewReport.parse(report), null, 2);
+}
 
-  // Header
-  lines.push("# Review Report");
-  lines.push("");
+export function renderReportMarkdown(
+  rawReport: ReviewReport,
+  rawFindings: Finding[] = [],
+): string {
+  const report = ReviewReport.parse(rawReport);
+  const findings = Finding.array().parse(rawFindings);
+  const byId = new Map(findings.map((finding) => [finding.findingId, finding]));
 
-  if (report.fixtureMode) {
+  const lines: string[] = [
+    "# Review Report",
+    "",
+    ...(report.fixtureMode
+      ? ["> **FIXTURE MODE** - not a production review.", ""]
+      : []),
+    safeText(report.executiveSummary),
+    "",
+    "## Change",
+    "",
+    safeText(report.changeSummary),
+    "",
+    `Risk: **${report.riskLevel.toUpperCase()}**`,
+    "",
+    safeText(report.riskFactorSummary),
+    "",
+    "## Conclusions",
+    "",
+    ...report.conclusions.map((conclusion) => `- ${conclusion}`),
+    "",
+  ];
+
+  const sections: Array<[string, string[]]> = [
+    ["Confirmed blocking findings", report.confirmedFindings],
+    ["Non-blocking suggestions", report.suggestions],
+    ["Unresolved concerns", report.unresolvedConcerns],
+  ];
+
+  for (const [title, ids] of sections) {
+    lines.push(`## ${title}`, "");
+
+    if (ids.length === 0) {
+      lines.push("None recorded.", "");
+      continue;
+    }
+
+    for (const id of ids) {
+      const finding = byId.get(id);
+
+      if (!finding) {
+        lines.push("Finding details were not supplied to the renderer.", "");
+        continue;
+      }
+
+      lines.push(
+        `### ${safeText(finding.claim)}`,
+        "",
+        `Path: ${safeText(finding.affectedPath)}`,
+        "",
+        `Status: **${finding.validationStatus}**; severity: ${finding.severity}.`,
+        "",
+        `Observed: ${safeText(finding.observedBehavior)}`,
+        "",
+        `Expected: ${safeText(finding.expectedBehavior)}`,
+        "",
+        `Validation: ${safeText(finding.validationRationale)}`,
+        "",
+        `Next action: ${safeText(finding.recommendedNextStep)}`,
+        "",
+        `Evidence references: ${finding.evidenceIds.length}.`,
+        "",
+      );
+    }
+  }
+
+  lines.push("## Coverage limitations", "");
+
+  if (report.coverageGaps.length === 0) {
+    lines.push("No limitations recorded.", "");
+  } else {
     lines.push(
-      "> ⚠️ **FIXTURE MODE** — This report was generated without a live model. " +
-        "Findings are from static pattern analysis only. This is NOT a production review.",
+      ...report.coverageGaps.map((gap) =>
+        `- ${safeText(gap.description)}`
+      ),
+      "",
     );
-    lines.push("");
   }
 
-  lines.push(`**Report ID:** \`${report.reportId}\``);
-  lines.push(`**Run ID:** \`${report.runId}\``);
-  lines.push(`**Generated:** ${report.createdAt}`);
-  lines.push(`**Schema Version:** ${report.schemaVersion}`);
-  lines.push("");
+  lines.push("## Verification", "");
 
-  // Summary
-  lines.push("## Executive Summary");
-  lines.push("");
-  lines.push(report.executiveSummary);
-  lines.push("");
-
-  // Risk
-  lines.push("## Risk Assessment");
-  lines.push("");
-  lines.push(`**Risk Level:** ${report.riskLevel.toUpperCase()}`);
-  lines.push(`**Summary:** ${report.riskFactorSummary}`);
-  lines.push("");
-
-  // Conclusions
-  lines.push("## Conclusions");
-  lines.push("");
-  for (const conclusion of report.conclusions) {
-    lines.push(`- \`${conclusion}\``);
-  }
-  lines.push("");
-
-  // Findings summary
-  lines.push("## Findings");
-  lines.push("");
-  lines.push(`- **Confirmed (blocking):** ${report.confirmedFindings.length}`);
-  lines.push(`- **Suggestions (non-blocking):** ${report.suggestions.length}`);
-  lines.push(`- **Unresolved concerns:** ${report.unresolvedConcerns.length}`);
-  lines.push(`- **Pending human decisions:** ${report.humanDecisionIds.length}`);
-  lines.push("");
-
-  // Coverage gaps
-  if (report.coverageGaps.length > 0) {
-    lines.push("## Coverage Gaps");
-    lines.push("");
-    for (const gap of report.coverageGaps) {
-      const mandatory = gap.isMandatory ? " **(mandatory)**" : "";
-      lines.push(`- **${gap.gapId}**${mandatory}: ${gap.description}`);
-    }
-    lines.push("");
-  }
-
-  // Verification
-  if (report.verificationRecords.length > 0) {
-    lines.push("## Verification Checks");
-    lines.push("");
+  if (report.verificationRecords.length === 0) {
+    lines.push("No execution results recorded.", "");
+  } else {
     for (const check of report.verificationRecords) {
-      lines.push(`- \`${check.commandId}\`: **${check.outcome}**${check.failureKind ? ` (${check.failureKind})` : ""}${check.attributionNote ? ` — ${check.attributionNote}` : ""}`);
+      lines.push(
+        `- ${safeText(check.commandId)}: **${safeText(check.outcome)}**`,
+      );
     }
     lines.push("");
   }
 
-  // Model traceability
-  if (report.modelTraceability.length > 0) {
-    lines.push("## Model Traceability");
-    lines.push("");
-    for (const trace of report.modelTraceability) {
-      const mode = trace.fixtureMode ? " [fixture]" : " [live]";
-      lines.push(`- \`${trace.provider}/${trace.modelId}\`${mode} — prompt: \`${trace.promptVersion}\``);
-    }
-    lines.push("");
-  }
-
-  // Footer: explicit non-approval statement
-  lines.push("---");
-  lines.push("");
   lines.push(
-    "> **Note:** This report describes what was reviewed within the defined scope. " +
-      "It does not constitute proof of correctness, security assurance, or approval to merge. " +
-      "Human judgment is required before acting on these findings.",
+    "---",
+    "",
+    "> This report does not constitute proof of correctness, security " +
+      "assurance, or approval to merge.",
+    "",
   );
-  lines.push("");
 
   return lines.join("\n");
 }
