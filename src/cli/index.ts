@@ -23,10 +23,7 @@ export function buildCli(): Command {
   program
     .name("review-copilot")
     .description("Evidence-backed, risk-aware pull request review system")
-    .version("0.1.0")
-    .option("--store-dir <dir>", "Override the store directory (default: ./review-copilot-data)")
-    .option("--policy <path>", "Path to the trusted policy JSON file")
-    .option("--fixture-mode", "Run in fixture mode (no live model, labeled output)", false);
+    .version("0.1.0");
 
   program.addCommand(capabilitiesCommand());
   program.addCommand(reviewCommand());

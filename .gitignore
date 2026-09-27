@@ -1,2 +1,4 @@
 node_modules
+dist/
+review-copilot-data/
 src/app/key.json
